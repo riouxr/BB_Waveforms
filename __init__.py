@@ -6,17 +6,36 @@ import colorsys
 bl_info = {
     "name": "BB Waveform",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > BB Waveform",
     "description": "Display audio waveforms in timeline, dopesheet, and graph editors",
     "category": "Animation",
 }
 
+# Constants
+BASE_WAVEFORM_WIDTH = 4000
+BASE_WAVEFORM_HEIGHT = 100
+PIXELS_PER_FRAME_PER_LEVEL = 4
+MAX_AUDIO_TRACKS = 16
+COLOR_UPDATE_DELAY = 0.3  # seconds
+
+# Minimal global state (will be cleaned up during refactor)
 _handlers = []
 _waveform_image = None
 _waveform_coords = None
-_rebuilding = False  # Flag to prevent recursive rebuilds
+_rebuilding = False
+_color_index = 0  # Track which color to assign next
+
+
+def check_ffmpeg_available():
+    """Check if FFmpeg is installed and available"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
 
 
 def rgb_to_hex(rgb):
@@ -51,7 +70,7 @@ def get_audio_tracks_info(filepath):
             '-of', 'json',
             str(filepath)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             import json
             data = json.loads(result.stdout)
@@ -83,7 +102,11 @@ def get_audio_tracks_info(filepath):
             return tracks
         else:
             return []
+    except subprocess.TimeoutExpired:
+        print("[WARNING] ffprobe timeout")
+        return []
     except Exception as e:
+        print(f"[WARNING] ffprobe error: {e}")
         return []
 
 
@@ -103,7 +126,7 @@ def get_audio_duration(filepath):
             '-of', 'json',
             str(filepath)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             import json
             data = json.loads(result.stdout)
@@ -111,8 +134,78 @@ def get_audio_duration(filepath):
             if duration:
                 return float(duration)
         return None
-    except Exception as e:
+    except subprocess.TimeoutExpired:
+        print("[WARNING] ffprobe timeout")
         return None
+    except Exception as e:
+        print(f"[WARNING] ffprobe error: {e}")
+        return None
+
+
+def build_overlay_filter(num_inputs):
+    """Build FFmpeg overlay filter chain for compositing multiple waveforms
+    
+    Returns filter string for overlaying N inputs with screen blend mode.
+    Example: [0:v][1:v]overlay[tmp1];[tmp1][2:v]overlay[tmp2];[tmp2][3:v]overlay
+    """
+    if num_inputs == 1:
+        return None  # No filter needed
+    
+    filter_parts = []
+    for i in range(num_inputs - 1):
+        if i == 0:
+            filter_parts.append('[0:v][1:v]overlay=0:0:format=auto')
+        else:
+            filter_parts.append(f'[tmp{i}][{i+1}:v]overlay=0:0:format=auto')
+        
+        # Add output label for all but the last overlay
+        if i < num_inputs - 2:
+            filter_parts.append(f'[tmp{i+1}];')
+    
+    return ''.join(filter_parts)
+
+
+def generate_composite_waveform(waveform_files, output_path):
+    """Composite multiple waveform images using FFmpeg overlay
+    
+    Args:
+        waveform_files: List of Path objects to individual waveform PNGs
+        output_path: Path where composite should be saved
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if len(waveform_files) == 1:
+        # Just copy the single file
+        import shutil
+        shutil.copy(waveform_files[0], output_path)
+        return True
+    
+    # Build input arguments
+    inputs = []
+    for wf in waveform_files:
+        inputs.extend(['-i', str(wf)])
+    
+    # Build filter chain
+    filter_str = build_overlay_filter(len(waveform_files))
+    
+    cmd = ['ffmpeg'] + inputs + [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-filter_complex', filter_str,
+        '-frames:v', '1',
+        '-y', str(output_path)
+    ]
+    
+    try:
+        ret = subprocess.call(cmd, timeout=30)
+        return ret == 0
+    except subprocess.TimeoutExpired:
+        print("[ERROR] FFmpeg composite timeout")
+        return False
+    except Exception as e:
+        print(f"[ERROR] FFmpeg composite failed: {e}")
+        return False
 
 
 def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_tracks=None, track_colors=None, all_red=False, track_order=None):
@@ -188,7 +281,14 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
             '-y', str(output_path)
         ]
         
-        ret = subprocess.call(cmd)
+        try:
+            ret = subprocess.call(cmd, timeout=30)
+        except subprocess.TimeoutExpired:
+            print(f"[WARNING] FFmpeg timeout on track {track_index}")
+            continue
+        except Exception as e:
+            print(f"[WARNING] FFmpeg error on track {track_index}: {e}")
+            continue
         
         if ret != 0:
             continue
@@ -209,46 +309,7 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
     # Composite all waveforms using ffmpeg
     composite_path = temp_dir / 'blender_waveform_mixed.png'
     
-    # Build ffmpeg filter for overlaying all tracks with screen blend mode
-    if len(waveform_files) == 1:
-        # Just copy the single file
-        waveform_files[0].replace(composite_path)
-    else:
-        # Create overlay filter chain
-        inputs = []
-        for wf in waveform_files:
-            inputs.extend(['-i', str(wf)])
-        
-        # Build filter: overlay each subsequent image
-        # Proper syntax: [0:v][1:v]overlay[tmp1];[tmp1][2:v]overlay[tmp2];[tmp2][3:v]overlay
-        filter_parts = []
-        for i in range(len(waveform_files) - 1):
-            if i == 0:
-                # First overlay: [0:v][1:v]overlay
-                filter_parts.append(f'[0:v][1:v]overlay=0:0:format=auto')
-            else:
-                # Subsequent overlays: [tmpN][N+1:v]overlay
-                filter_parts.append(f'[tmp{i}][{i+1}:v]overlay=0:0:format=auto')
-            
-            # Add output label for all but the last overlay
-            if i < len(waveform_files) - 2:
-                filter_parts.append(f'[tmp{i+1}];')
-        
-        filter_str = ''.join(filter_parts)
-        
-        cmd = ['ffmpeg'] + inputs + [
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-filter_complex', filter_str,
-            '-frames:v', '1',
-            '-y', str(composite_path)
-        ]
-        
-        ret = subprocess.call(cmd)
-        
-        if ret != 0:
-            print("[MULTITRACK] Composite failed")
-            return None, None
+    success = generate_composite_waveform(waveform_files, composite_path)
     
     # Clean up individual track files
     for wf in waveform_files:
@@ -257,7 +318,8 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
         except:
             pass
     
-    if not composite_path.exists():
+    if not success or not composite_path.exists():
+        print("[MULTITRACK] Composite failed")
         return None, None
     
     # Load into Blender
@@ -270,8 +332,12 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
         except:
             pass
     
-    img = bpy.data.images.load(str(composite_path), check_existing=False)
-    img.name = img_name
+    try:
+        img = bpy.data.images.load(str(composite_path), check_existing=False)
+        img.name = img_name
+    except Exception as e:
+        print(f"[ERROR] Failed to load composite image: {e}")
+        return None, None
     
     
     return img, composite_path
@@ -318,7 +384,14 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
             '-y', str(output_path)
         ]
         
-        ret = subprocess.call(cmd)
+        try:
+            ret = subprocess.call(cmd, timeout=30)
+        except subprocess.TimeoutExpired:
+            print(f"[WARNING] FFmpeg timeout on strip {strip.name}")
+            continue
+        except Exception as e:
+            print(f"[WARNING] FFmpeg error on strip {strip.name}: {e}")
+            continue
         
         if ret != 0:
             continue
@@ -335,46 +408,7 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
     # Composite all waveforms using ffmpeg (same as multitrack)
     composite_path = temp_dir / 'blender_waveform_strips_mixed.png'
     
-    if len(waveform_files) == 1:
-        # Just copy the single file
-        import shutil
-        shutil.copy(waveform_files[0], composite_path)
-    else:
-        # Create overlay filter chain (same as multitrack)
-        inputs = []
-        for wf in waveform_files:
-            inputs.extend(['-i', str(wf)])
-        
-        # Build filter: overlay each subsequent image
-        # Proper syntax: [0:v][1:v]overlay[tmp1];[tmp1][2:v]overlay[tmp2];[tmp2][3:v]overlay
-        filter_parts = []
-        for i in range(len(waveform_files) - 1):
-            if i == 0:
-                # First overlay: [0:v][1:v]overlay
-                filter_parts.append(f'[0:v][1:v]overlay=0:0:format=auto')
-            else:
-                # Subsequent overlays: [tmpN][N+1:v]overlay
-                filter_parts.append(f'[tmp{i}][{i+1}:v]overlay=0:0:format=auto')
-            
-            # Add output label for all but the last overlay
-            if i < len(waveform_files) - 2:
-                filter_parts.append(f'[tmp{i+1}];')
-        
-        filter_str = ''.join(filter_parts)
-        
-        cmd = ['ffmpeg'] + inputs + [
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-filter_complex', filter_str,
-            '-frames:v', '1',
-            '-y', str(composite_path)
-        ]
-        
-        ret = subprocess.call(cmd)
-        
-        if ret != 0:
-            print("[MULTISTRIP] Composite failed")
-            return None, None
+    success = generate_composite_waveform(waveform_files, composite_path)
     
     # Clean up individual files
     for wf in waveform_files:
@@ -383,7 +417,8 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
         except:
             pass
     
-    if not composite_path.exists():
+    if not success or not composite_path.exists():
+        print("[MULTISTRIP] Composite failed")
         return None, None
     
     # Load into Blender
@@ -396,8 +431,12 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
         except:
             pass
     
-    img = bpy.data.images.load(str(composite_path), check_existing=False)
-    img.name = img_name
+    try:
+        img = bpy.data.images.load(str(composite_path), check_existing=False)
+        img.name = img_name
+    except Exception as e:
+        print(f"[ERROR] Failed to load composite image: {e}")
+        return None, None
     
     
     return img, composite_path
@@ -425,14 +464,23 @@ def generate_waveform_image(filepath, start_frame, color=(1, 0.3, 0.3), width=40
     import time
     start_time = time.time()
     
-    ret = subprocess.call(cmd)
+    try:
+        ret = subprocess.call(cmd, timeout=30)
+    except subprocess.TimeoutExpired:
+        print("[ERROR] FFmpeg waveform generation timeout")
+        return None, None
+    except Exception as e:
+        print(f"[ERROR] FFmpeg waveform generation failed: {e}")
+        return None, None
     
     elapsed = time.time() - start_time
     
     if ret != 0:
+        print(f"[ERROR] FFmpeg returned error code {ret}")
         return None, None
     
     if not output_path.exists():
+        print("[ERROR] Waveform file not created")
         return None, None
     
     img_name = 'waveform_temp'
@@ -446,8 +494,12 @@ def generate_waveform_image(filepath, start_frame, color=(1, 0.3, 0.3), width=40
         except:
             pass
     
-    img = bpy.data.images.load(str(output_path), check_existing=False)
-    img.name = img_name
+    try:
+        img = bpy.data.images.load(str(output_path), check_existing=False)
+        img.name = img_name
+    except Exception as e:
+        print(f"[ERROR] Failed to load waveform image: {e}")
+        return None, None
     
     
     return img, output_path
@@ -497,8 +549,7 @@ def draw_callback(self, context):
     
     # Calculate height - use a fixed base height scaled by height_offset
     # Don't use image aspect ratio since resolution changes shouldn't affect visual height
-    base_height = 100  # Base height in pixels
-    height_in_pixels = base_height * s.height_offset
+    height_in_pixels = BASE_WAVEFORM_HEIGHT * s.height_offset
     
     bottom_y_pixels = margin
     
@@ -511,21 +562,24 @@ def draw_callback(self, context):
     ]
     
     # Draw image
-    shader = gpu.shader.from_builtin('IMAGE')
-    batch = batch_for_shader(
-        shader, 'TRI_FAN',
-        {
-            "pos": coords,
-            "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1)),
-        },
-    )
-    
-    texture = gpu.texture.from_image(_waveform_image)
-    gpu.state.blend_set('ADDITIVE')
-    shader.uniform_sampler("image", texture)
-    shader.bind()
-    batch.draw(shader)
-    gpu.state.blend_set('NONE')
+    try:
+        shader = gpu.shader.from_builtin('IMAGE')
+        batch = batch_for_shader(
+            shader, 'TRI_FAN',
+            {
+                "pos": coords,
+                "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1)),
+            },
+        )
+        
+        texture = gpu.texture.from_image(_waveform_image)
+        gpu.state.blend_set('ADDITIVE')
+        shader.uniform_sampler("image", texture)
+        shader.bind()
+        batch.draw(shader)
+        gpu.state.blend_set('NONE')
+    except Exception as e:
+        print(f"[ERROR] GPU draw failed: {e}")
 
 
 def clear_handlers():
@@ -660,12 +714,43 @@ def resolution_level_update(s, context):
     global _rebuilding
     if _rebuilding:
         return
-    s.resolution = 4000 * s.resolution_level
+    s.resolution = BASE_WAVEFORM_WIDTH * s.resolution_level
     rebuild(context)
 
 
-def rebuild(context):
-    global _waveform_image, _waveform_coords, _rebuilding
+# Using bpy.app.timers instead of threading.Timer (Blender-safe)
+def schedule_color_update(context):
+    """Schedule a color update using Blender's timer system - will only fire after user stops changing color"""
+    
+    # Cancel any existing timer by unregistering the function
+    if bpy.app.timers.is_registered(delayed_rebuild):
+        bpy.app.timers.unregister(delayed_rebuild)
+    
+    # Schedule a new update for COLOR_UPDATE_DELAY seconds from now
+    # This way, it only fires when user stops dragging
+    def delayed_rebuild():
+        rebuild(context)
+        return None  # Don't repeat
+    
+    bpy.app.timers.register(delayed_rebuild, first_interval=COLOR_UPDATE_DELAY)
+
+
+def get_random_color():
+    """Generate colors with evenly distributed hues using golden ratio"""
+    global _color_index
+    
+    # Use golden ratio to distribute hues evenly
+    golden_ratio = 0.618033988749895
+    hue = (_color_index * golden_ratio) % 1.0
+    _color_index += 1
+    
+    # High saturation and value for vibrant colors
+    saturation = 0.8
+    value = 1.0
+    
+    # Convert HSV to RGB
+    r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+    return (r, g, b)
 
 
 class BB_TrackColorItem(bpy.types.PropertyGroup):
@@ -694,45 +779,6 @@ class BB_StripColorItem(bpy.types.PropertyGroup):
     )
 
 
-_color_update_timer = None
-
-
-def schedule_color_update(context):
-    """Schedule a color update - will only fire after user stops changing color"""
-    global _color_update_timer
-    
-    # Cancel any existing timer
-    if _color_update_timer is not None and _color_update_timer.is_alive:
-        _color_update_timer.cancel()
-    
-    # Schedule a new update for 0.3 seconds from now
-    # This way, it only fires when user stops dragging
-    import threading
-    _color_update_timer = threading.Timer(0.3, lambda: rebuild(context))
-    _color_update_timer.start()
-
-
-_color_index = 0  # Track which color to assign next
-
-
-def get_random_color():
-    """Generate colors with evenly distributed hues"""
-    global _color_index
-    
-    # Use golden ratio to distribute hues evenly
-    golden_ratio = 0.618033988749895
-    hue = (_color_index * golden_ratio) % 1.0
-    _color_index += 1
-    
-    # High saturation and value for vibrant colors
-    saturation = 0.8
-    value = 1.0
-    
-    # Convert HSV to RGB
-    r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
-    return (r, g, b)
-
-
 def rebuild(context):
     global _waveform_image, _waveform_coords, _rebuilding
     
@@ -746,8 +792,8 @@ def rebuild(context):
         s = context.scene.waveform_settings
         
         # Sync resolution_level with resolution (in case resolution was changed directly)
-        if s.resolution >= 4000:
-            s.resolution_level = max(1, s.resolution // 4000)
+        if s.resolution >= BASE_WAVEFORM_WIDTH:
+            s.resolution_level = max(1, s.resolution // BASE_WAVEFORM_WIDTH)
         
         if not s.enabled:
             clear_handlers()
@@ -826,13 +872,14 @@ def rebuild(context):
                 sw_frames = end_frame - start_frame
                 
                 # Calculate width based on frame duration
-                pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+                pixels_per_frame = s.resolution_level * PIXELS_PER_FRAME_PER_LEVEL
                 waveform_width = int(sw_frames * pixels_per_frame)
                 
                 # Generate multistrip composite
+                fps = context.scene.render.fps / context.scene.render.fps_base
                 img, img_path = generate_multistrip_waveform(enabled_sound_strips, start_frame, end_frame, 
                                                             width=waveform_width, strip_colors=s.strip_colors,
-                                                            all_red=s.all_channels_red)
+                                                            fps=fps, all_red=s.all_channels_red)
                 if not img:
                     print("ERROR generating multistrip waveform")
                     return
@@ -842,8 +889,8 @@ def rebuild(context):
                 _waveform_coords = (
                     (start_frame, 0),
                     (start_frame + sw_frames, 0),
-                    (start_frame + sw_frames, 100),
-                    (start_frame, 100)
+                    (start_frame + sw_frames, BASE_WAVEFORM_HEIGHT),
+                    (start_frame, BASE_WAVEFORM_HEIGHT)
                 )
                 
                 
@@ -926,8 +973,8 @@ def rebuild(context):
                         traceback.print_exc()
                         sw_frames = 250  # fallback
             
-            # Add to sequencer for audio playback
-            if not existing_strip:
+            # Add to sequencer for audio playback if add_to_sequencer is enabled
+            if not existing_strip and s.add_to_sequencer:
                 if not context.scene.sequence_editor:
                     context.scene.sequence_editor_create()
                 
@@ -960,7 +1007,7 @@ def rebuild(context):
             if enabled_count > 1:
                 # Calculate width based on frame duration and resolution level
                 # This ensures the waveform pixel width matches the timeline frame range exactly
-                pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+                pixels_per_frame = s.resolution_level * PIXELS_PER_FRAME_PER_LEVEL
                 waveform_width = int(sw_frames * pixels_per_frame)
                 
                 # Generate mixed multi-track waveform
@@ -978,7 +1025,7 @@ def rebuild(context):
                         break
                 
                 # Calculate width based on frame duration
-                pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+                pixels_per_frame = s.resolution_level * PIXELS_PER_FRAME_PER_LEVEL
                 waveform_width = int(sw_frames * pixels_per_frame)
                 
                 # Get the color for this track
@@ -997,8 +1044,10 @@ def rebuild(context):
         else:
             # SEQ mode - single strip waveform (color already set)
             # Calculate width based on frame duration
-            pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+            pixels_per_frame = s.resolution_level * PIXELS_PER_FRAME_PER_LEVEL
             waveform_width = int(sw_frames * pixels_per_frame)
+            
+            # Generate waveform
             img, img_path = generate_waveform_image(path, start_frame, color=color, width=waveform_width, audio_track=0)
         
         if not img:
@@ -1007,21 +1056,19 @@ def rebuild(context):
         
         _waveform_image = img
         
-        # Set up coordinates for drawing with actual frame duration
         _waveform_coords = (
             (start_frame, 0),
             (start_frame + sw_frames, 0),
-            (start_frame + sw_frames, 100),
-            (start_frame, 100)
+            (start_frame + sw_frames, BASE_WAVEFORM_HEIGHT),
+            (start_frame, BASE_WAVEFORM_HEIGHT)
         )
         
         
         setup_handlers(context)
         
-        # Redraw all areas
         for area in context.screen.areas:
             area.tag_redraw()
-    
+        
     finally:
         _rebuilding = False
 
@@ -1030,388 +1077,399 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(
         name="Enable Waveform",
         default=False,
-        update=lambda s, c: waveform_enabled_changed(s, c)
+        update=waveform_enabled_changed
     )
+    
     source: bpy.props.EnumProperty(
-        name="Source",
-        items=[("SEQ", "Sequencer", ""), ("FILE", "File", "")],
-        default="SEQ",
-        update=lambda s, c: source_changed(s, c)
+        name="Audio Source",
+        items=[
+            ('FILE', 'File', 'Use external audio file'),
+            ('SEQ', 'Sequencer', 'Use audio from sequencer strips')
+        ],
+        default='FILE',
+        update=source_changed
     )
+    
     filepath: bpy.props.StringProperty(
         name="Audio File",
-        subtype="FILE_PATH",
-        update=lambda s, c: filepath_changed(s, c)
+        subtype='FILE_PATH',
+        update=filepath_changed
     )
+    
     start_frame: bpy.props.IntProperty(
         name="Start Frame",
         default=1,
+        min=0,
         update=lambda s, c: rebuild(c)
     )
+    
+    show_ds: bpy.props.BoolProperty(
+        name="Show in Dope Sheet",
+        default=True,
+        update=lambda s, c: setup_handlers(c)
+    )
+    
+    show_graph: bpy.props.BoolProperty(
+        name="Show in Graph Editor",
+        default=True,
+        update=lambda s, c: setup_handlers(c)
+    )
+    
     height_offset: bpy.props.FloatProperty(
-        name="Height Scale",
+        name="Height",
         default=1.0,
         min=0.1,
-        max=10.0,
-        soft_min=0.5,
-        soft_max=10.0
+        max=5.0,
+        update=lambda s, c: [area.tag_redraw() for area in c.screen.areas]
     )
-    show_ds: bpy.props.BoolProperty(
-        name="Dopesheet/Timeline",
-        default=True,
-        update=lambda s, c: setup_handlers(c)
-    )
-    show_graph: bpy.props.BoolProperty(
-        name="Graph Editor",
-        default=False,
-        update=lambda s, c: setup_handlers(c)
-    )
-    add_to_sequencer: bpy.props.BoolProperty(
-        name="Add to Sequencer (for audio playback)",
-        description="Add the audio file to the sequencer so it plays during animation",
-        default=True,
-        update=lambda s, c: rebuild(c)
-    )
+    
     resolution: bpy.props.IntProperty(
         name="Resolution",
-        description="Waveform image width in pixels (internal)",
-        default=4000,
+        default=BASE_WAVEFORM_WIDTH,
         min=1000,
-        max=32000
+        max=32000,
+        update=lambda s, c: rebuild(c)
     )
+    
     resolution_level: bpy.props.IntProperty(
         name="Resolution Level",
-        description="Resolution quality level (1=4000px, 2=8000px, etc.)",
+        description="Multiplier for base resolution (4000 pixels)",
         default=1,
         min=1,
         max=8,
-        update=lambda s, c: resolution_level_update(s, c)
+        update=resolution_level_update
     )
-    strip_channel: bpy.props.IntProperty(
-        name="Channel",
-        description="Sequencer channel to use for waveform",
-        default=1,
-        min=1,
-        max=32
-    )
-    audio_track: bpy.props.IntProperty(
-        name="Audio Track",
-        description="Which audio track to use from the file (0=first, 1=second, etc.)",
-        default=0,
-        min=-1,  # -1 = all tracks mixed
-        max=15,
-        update=lambda s, c: rebuild(c)
-    )
-    enabled_tracks: bpy.props.BoolVectorProperty(
-        name="Enabled Tracks",
-        description="Which tracks to show in the waveform",
-        size=16,
-        default=[True] + [False] * 15,
-        update=lambda s, c: rebuild(c)  # Add update callback
-    )
-    track_order: bpy.props.IntVectorProperty(
-        name="Track Order",
-        description="Display order for audio tracks (FILE mode)",
-        size=16,
-        default=list(range(16))
-    )
-    strip_order: bpy.props.StringProperty(
-        name="Strip Order",
-        description="Comma-separated list of strip names in display order (SEQ mode)",
-        default=""
-    )
+    
+    # Multi-strip support (for SEQ mode)
     enabled_strips: bpy.props.StringProperty(
         name="Enabled Strips",
-        description="Comma-separated list of enabled strip names",
+        default="",
+        update=lambda s, c: rebuild(c)
+    )
+    
+    strip_order: bpy.props.StringProperty(
+        name="Strip Order",
+        description="Order of strips for display (comma-separated strip names)",
         default=""
     )
+    
+    strip_colors: bpy.props.CollectionProperty(type=BB_StripColorItem)
+    
     all_channels_red: bpy.props.BoolProperty(
-        name="All Channels Red Mode",
-        default=False,
-        description="When true, all sequencer strips display in red"
+        name="All Channels Red",
+        description="Force all sequencer strips to display in red",
+        default=True
     )
+    
+    # Multi-track support (for FILE mode)
+    enabled_tracks: bpy.props.BoolVectorProperty(
+        name="Enabled Tracks",
+        size=MAX_AUDIO_TRACKS,
+        default=[True] + [False] * (MAX_AUDIO_TRACKS - 1)
+    )
+    
+    track_order: bpy.props.IntVectorProperty(
+        name="Track Order",
+        description="Order of tracks for display",
+        size=MAX_AUDIO_TRACKS,
+        default=tuple(range(MAX_AUDIO_TRACKS))
+    )
+    
+    track_colors: bpy.props.CollectionProperty(type=BB_TrackColorItem)
+    
     all_tracks_red: bpy.props.BoolProperty(
-        name="All Tracks Red Mode",
-        default=False,
-        description="When true, all audio tracks display in red"
+        name="All Tracks Red",
+        description="Force all audio tracks to display in red",
+        default=True
     )
-    track_colors: bpy.props.CollectionProperty(
-        type=BB_TrackColorItem,
-        name="Track Colors"
+    
+    add_to_sequencer: bpy.props.BoolProperty(
+        name="Add to Sequencer",
+        description="Automatically add audio file to sequencer for playback",
+        default=True
     )
-    strip_colors: bpy.props.CollectionProperty(
-        type=BB_StripColorItem,
-        name="Strip Colors"
-    )
-
-
-def draw_ui(self, ctx):
-    s = ctx.scene.waveform_settings
-    layout = self.layout
-    
-    layout.prop(s, "enabled")
-    
-    layout.separator()
-    layout.label(text="Show in:")
-    layout.prop(s, "show_ds")
-    layout.prop(s, "show_graph")
-    
-    if s.enabled:
-        layout.separator()
-        layout.prop(s, "source", expand=True)
-        
-        if s.source == "SEQ":
-            row = layout.row(align=True)
-            row.operator("waveform.all_channels", text="All Tracks", icon='ALIGN_JUSTIFY')
-            row.operator("waveform.select_channel", text="Select Tracks", icon='PRESET')
-        
-        if s.source == "FILE":
-            layout.prop(s, "filepath")
-            layout.prop(s, "start_frame")
-            row = layout.row(align=True)
-            row.operator("waveform.all_tracks", text="All Tracks", icon='ALIGN_JUSTIFY')
-            row.operator("waveform.select_audio_track", text="Select Tracks", icon='PRESET')
-        
-        layout.separator()
-        layout.prop(s, "height_offset", slider=True, text="Height Scale")
-        
-        # Show resolution level with built-in +/- spinners
-        layout.prop(s, "resolution_level")
 
 
 class BB_PT_dopesheet(bpy.types.Panel):
     bl_label = "BB Waveform"
-    bl_space_type = "DOPESHEET_EDITOR"
-    bl_region_type = "UI"
-    bl_category = "BB Waveform"
-    draw = draw_ui
+    bl_idname = "BB_PT_dopesheet"
+    bl_space_type = 'DOPESHEET_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = 'BB Waveform'
+    
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.waveform_settings
+        
+        # Check for FFmpeg on first draw
+        if not check_ffmpeg_available():
+            box = layout.box()
+            box.alert = True
+            col = box.column(align=True)
+            col.label(text="FFmpeg Not Found!", icon='ERROR')
+            col.label(text="This addon requires FFmpeg")
+            col.label(text="and ffprobe to be installed")
+            col.label(text="and available in your PATH.")
+            col.separator()
+            col.label(text="Download from ffmpeg.org")
+            return
+        
+        layout.prop(s, "enabled", toggle=True)
+        
+        if not s.enabled:
+            return
+        
+        layout.separator()
+        
+        # Source selection
+        layout.prop(s, "source", expand=True)
+        
+        layout.separator()
+        
+        if s.source == "FILE":
+            # FILE mode settings
+            layout.prop(s, "filepath")
+            
+            if s.filepath:
+                path = bpy.path.abspath(s.filepath)
+                if Path(path).exists():
+                    # Check if file has multiple tracks
+                    available_tracks = get_audio_track_count(path)
+                    
+                    if available_tracks > 1:
+                        # Multi-track file
+                        box = layout.box()
+                        box.label(text=f"Multi-track audio ({available_tracks} tracks)", icon='SOUND')
+                        
+                        row = box.row()
+                        row.prop(s, "all_tracks_red", text="All Tracks", toggle=True)
+                        row.operator("waveform.select_audio_track", text="Select Tracks", icon='RESTRICT_SELECT_OFF')
+                    else:
+                        # Single track file
+                        layout.label(text="Single track audio", icon='SOUND')
+                else:
+                    layout.label(text="File not found", icon='ERROR')
+            
+            layout.separator()
+            
+            row = layout.row()
+            row.prop(s, "start_frame")
+            
+            layout.separator()
+            
+            row = layout.row()
+            row.prop(s, "add_to_sequencer")
+            
+        else:
+            # SEQ mode settings
+            seq = context.scene.sequence_editor
+            if not seq:
+                layout.label(text="No sequencer", icon='ERROR')
+                return
+            
+            sound_strips = [s for s in seq.sequences if s.type == 'SOUND']
+            
+            if not sound_strips:
+                layout.label(text="No audio strips in sequencer", icon='INFO')
+            else:
+                if len(sound_strips) > 1:
+                    box = layout.box()
+                    box.label(text=f"Multiple audio strips ({len(sound_strips)})", icon='SOUND')
+                    
+                    row = box.row()
+                    row.prop(s, "all_channels_red", text="All Channels", toggle=True)
+                    row.operator("waveform.select_channel", text="Select Strips", icon='RESTRICT_SELECT_OFF')
+                else:
+                    layout.label(text="Single audio strip", icon='SOUND')
+        
+        layout.separator()
+        
+        # Display settings
+        box = layout.box()
+        box.label(text="Display", icon='RESTRICT_VIEW_OFF')
+        box.prop(s, "show_ds", text="Dope Sheet")
+        box.prop(s, "show_graph", text="Graph Editor")
+        box.prop(s, "height_offset")
+        
+        layout.separator()
+        
+        # Resolution settings
+        box = layout.box()
+        box.label(text="Resolution", icon='IMAGE_DATA')
+        box.prop(s, "resolution_level", text="Level")
+        box.label(text=f"Pixels: {s.resolution}")
 
 
 class BB_PT_graph(bpy.types.Panel):
     bl_label = "BB Waveform"
-    bl_space_type = "GRAPH_EDITOR"
-    bl_region_type = "UI"
-    bl_category = "BB Waveform"
-    draw = draw_ui
-
-
-class BB_OT_upscale(bpy.types.Operator):
-    bl_idname = "waveform.upscale"
-    bl_label = "+"
-    bl_description = "Increase resolution level"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_idname = "BB_PT_graph"
+    bl_space_type = 'GRAPH_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = 'BB Waveform'
     
-    def execute(self, context):
+    def draw(self, context):
+        layout = self.layout
         s = context.scene.waveform_settings
         
-        if s.resolution_level >= 8:
-            self.report({'WARNING'}, 'Maximum resolution level reached')
-            return {'CANCELLED'}
+        # Check for FFmpeg on first draw
+        if not check_ffmpeg_available():
+            box = layout.box()
+            box.alert = True
+            col = box.column(align=True)
+            col.label(text="FFmpeg Not Found!", icon='ERROR')
+            col.label(text="This addon requires FFmpeg")
+            col.label(text="and ffprobe to be installed")
+            col.label(text="and available in your PATH.")
+            col.separator()
+            col.label(text="Download from ffmpeg.org")
+            return
         
-        s.resolution_level += 1
-        s.resolution = 4000 * s.resolution_level
+        layout.prop(s, "enabled", toggle=True)
         
-        self.report({'INFO'}, f'Resolution level: {s.resolution_level}')
+        if not s.enabled:
+            return
         
-        # Trigger rebuild with new resolution
-        rebuild(context)
-        return {'FINISHED'}
-
-
-class BB_OT_downscale(bpy.types.Operator):
-    bl_idname = "waveform.downscale"
-    bl_label = "-"
-    bl_description = "Decrease resolution level"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        s = context.scene.waveform_settings
+        layout.separator()
         
-        if s.resolution_level <= 1:
-            self.report({'WARNING'}, 'Minimum resolution level reached')
-            return {'CANCELLED'}
+        # Source selection
+        layout.prop(s, "source", expand=True)
         
-        s.resolution_level -= 1
-        s.resolution = 4000 * s.resolution_level
+        layout.separator()
         
-        self.report({'INFO'}, f'Resolution level: {s.resolution_level}')
+        if s.source == "FILE":
+            # FILE mode settings
+            layout.prop(s, "filepath")
+            
+            if s.filepath:
+                path = bpy.path.abspath(s.filepath)
+                if Path(path).exists():
+                    # Check if file has multiple tracks
+                    available_tracks = get_audio_track_count(path)
+                    
+                    if available_tracks > 1:
+                        # Multi-track file
+                        box = layout.box()
+                        box.label(text=f"Multi-track audio ({available_tracks} tracks)", icon='SOUND')
+                        
+                        row = box.row()
+                        row.prop(s, "all_tracks_red", text="All Tracks", toggle=True)
+                        row.operator("waveform.select_audio_track", text="Select Tracks", icon='RESTRICT_SELECT_OFF')
+                    else:
+                        # Single track file
+                        layout.label(text="Single track audio", icon='SOUND')
+                else:
+                    layout.label(text="File not found", icon='ERROR')
+            
+            layout.separator()
+            
+            row = layout.row()
+            row.prop(s, "start_frame")
+            
+            layout.separator()
+            
+            row = layout.row()
+            row.prop(s, "add_to_sequencer")
+            
+        else:
+            # SEQ mode settings
+            seq = context.scene.sequence_editor
+            if not seq:
+                layout.label(text="No sequencer", icon='ERROR')
+                return
+            
+            sound_strips = [s for s in seq.sequences if s.type == 'SOUND']
+            
+            if not sound_strips:
+                layout.label(text="No audio strips in sequencer", icon='INFO')
+            else:
+                if len(sound_strips) > 1:
+                    box = layout.box()
+                    box.label(text=f"Multiple audio strips ({len(sound_strips)})", icon='SOUND')
+                    
+                    row = box.row()
+                    row.prop(s, "all_channels_red", text="All Channels", toggle=True)
+                    row.operator("waveform.select_channel", text="Select Strips", icon='RESTRICT_SELECT_OFF')
+                else:
+                    layout.label(text="Single audio strip", icon='SOUND')
         
-        # Trigger rebuild with new resolution
-        rebuild(context)
-        return {'FINISHED'}
+        layout.separator()
+        
+        # Display settings
+        box = layout.box()
+        box.label(text="Display", icon='RESTRICT_VIEW_OFF')
+        box.prop(s, "show_ds", text="Dope Sheet")
+        box.prop(s, "show_graph", text="Graph Editor")
+        box.prop(s, "height_offset")
+        
+        layout.separator()
+        
+        # Resolution settings
+        box = layout.box()
+        box.label(text="Resolution", icon='IMAGE_DATA')
+        box.prop(s, "resolution_level", text="Level")
+        box.label(text=f"Pixels: {s.resolution}")
 
 
 class BB_OT_all_channels(bpy.types.Operator):
+    """Show all audio strips in red (click Select Strips to customize colors)"""
     bl_idname = "waveform.all_channels"
-    bl_label = "All Tracks"
-    bl_description = "Enable all sequencer strips in red"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "All Channels"
+    bl_options = {'INTERNAL'}
     
     def execute(self, context):
         s = context.scene.waveform_settings
-        
-        if not context.scene.sequence_editor:
-            self.report({'ERROR'}, 'No sequence editor')
-            return {'CANCELLED'}
-        
-        seq = context.scene.sequence_editor
-        strip_names = []
-        
-        # Get all sound strips
-        for strip in seq.sequences:
-            if strip.type == 'SOUND':
-                strip_names.append(strip.name)
-                
-                # Initialize color entries with random colors if they don't exist
-                # But DON'T modify existing colors
-                found = False
-                for item in s.strip_colors:
-                    if item.name == strip.name:
-                        found = True
-                        break
-                if not found:
-                    new_item = s.strip_colors.add()
-                    new_item.name = strip.name
-                    new_item.color = get_random_color()
-        
-        if not strip_names:
-            self.report({'ERROR'}, 'No sound strips found')
-            return {'CANCELLED'}
-        
-        # Enable all strips and set red mode flag
-        s.enabled_strips = ','.join(strip_names)
-        s.all_channels_red = True  # Flag to display in red
-        
-        self.report({'INFO'}, f'Enabled {len(strip_names)} strips in red')
+        s.all_channels_red = True
         rebuild(context)
         return {'FINISHED'}
 
 
 class BB_OT_all_tracks(bpy.types.Operator):
+    """Show all audio tracks in red (click Select Tracks to customize colors)"""
     bl_idname = "waveform.all_tracks"
     bl_label = "All Tracks"
-    bl_description = "Enable all audio tracks in red"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'INTERNAL'}
     
     def execute(self, context):
         s = context.scene.waveform_settings
-        
-        if not s.filepath:
-            self.report({'ERROR'}, 'No file selected')
-            return {'CANCELLED'}
-        
-        path = bpy.path.abspath(s.filepath)
-        if not Path(path).exists():
-            self.report({'ERROR'}, 'File does not exist')
-            return {'CANCELLED'}
-        
-        # Get track count
-        track_count = get_audio_track_count(path)
-        
-        if track_count == 0:
-            self.report({'ERROR'}, 'No audio tracks found')
-            return {'CANCELLED'}
-        
-        # Enable all tracks and initialize colors if needed
-        for i in range(track_count):
-            s.enabled_tracks[i] = True
-            
-            # Initialize color entries with random colors if they don't exist
-            # But DON'T modify existing colors
-            track_id = str(i)
-            found = False
-            for item in s.track_colors:
-                if item.name == track_id:
-                    found = True
-                    break
-            if not found:
-                new_item = s.track_colors.add()
-                new_item.name = track_id
-                new_item.color = get_random_color()
-        
-        # Set the all_tracks_red flag to display in red
         s.all_tracks_red = True
-        
-        self.report({'INFO'}, f'Enabled {track_count} tracks in red')
         rebuild(context)
         return {'FINISHED'}
 
 
 class BB_OT_select_channel(bpy.types.Operator):
+    """Select which audio strips to display and customize their colors"""
     bl_idname = "waveform.select_channel"
-    bl_label = "Select Tracks"
-    bl_description = "Choose which sequencer strips to use for waveform"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Select Strips"
     
-    def get_sound_strips(self, context):
-        """Get all sound strips in the sequencer, ordered by strip_order if available"""
-        if not context.scene.sequence_editor:
+    def get_strips(self, context):
+        seq = context.scene.sequence_editor
+        if not seq:
             return []
         
-        seq = context.scene.sequence_editor
-        s = context.scene.waveform_settings
+        strips = []
+        for strip in seq.sequences:
+            if strip.type == 'SOUND':
+                strips.append(strip)
         
-        # Get all sound strips
-        sound_strips = [strip for strip in seq.sequences if strip.type == 'SOUND']
-        
-        # If we have a strip order, use it
-        if s.strip_order:
-            order_names = s.strip_order.split(',')
-            # Create a dict for quick lookup
-            strip_dict = {strip.name: strip for strip in sound_strips}
-            # Reorder based on strip_order
-            ordered_strips = []
-            for name in order_names:
-                if name in strip_dict:
-                    ordered_strips.append(strip_dict[name])
-                    del strip_dict[name]
-            # Add any strips not in the order list at the end
-            ordered_strips.extend(strip_dict.values())
-            return ordered_strips
-        
-        return sound_strips
+        return strips
     
     def invoke(self, context, event):
-        if not context.scene.sequence_editor:
-            self.report({'ERROR'}, 'No sound strips in sequencer')
+        strips = self.get_strips(context)
+        
+        if not strips:
+            self.report({'ERROR'}, 'No audio strips found')
             return {'CANCELLED'}
         
-        seq = context.scene.sequence_editor
+        if len(strips) == 1:
+            self.report({'INFO'}, 'Only one audio strip available')
+            return {'CANCELLED'}
+        
+        # Initialize colors for strips that don't have them yet
         s = context.scene.waveform_settings
-        
-        # Get all sound strips (raw, unordered)
-        sound_strips = [strip for strip in seq.sequences if strip.type == 'SOUND']
-        
-        if not sound_strips:
-            self.report({'ERROR'}, 'No sound strips in sequencer')
-            return {'CANCELLED'}
-        
-        # Update strip_order to include all strips
-        if s.strip_order:
-            order_names = s.strip_order.split(',')
-            # Add any new strips that aren't in the order yet (at the end)
-            existing_names = set(order_names)
-            for strip in sound_strips:
-                if strip.name not in existing_names:
-                    order_names.append(strip.name)
-            # Remove any strips that no longer exist
-            current_strip_names = {strip.name for strip in sound_strips}
-            order_names = [name for name in order_names if name in current_strip_names]
-            s.strip_order = ','.join(order_names)
-        else:
-            # Initialize strip_order with natural order
-            s.strip_order = ','.join(strip.name for strip in sound_strips)
-        
-        # Now get ordered strips
-        sound_strips = self.get_sound_strips(context)
-        
-        # If enabled_strips is empty, enable only the first strip
-        if not s.enabled_strips:
-            s.enabled_strips = sound_strips[0].name
         
         # Only create color entries for new strips - preserve all existing colors
         # This MUST happen BEFORE clearing the all_channels_red flag
-        for strip in sound_strips:
+        for strip in strips:
             existing = None
             for item in s.strip_colors:
                 if item.name == strip.name:
@@ -1432,37 +1490,53 @@ class BB_OT_select_channel(bpy.types.Operator):
     
     def draw(self, context):
         layout = self.layout
-        sound_strips = self.get_sound_strips(context)
+        strips = self.get_strips(context)
         s = context.scene.waveform_settings
+        
+        layout.label(text="Select strips to display:", icon='SOUND')
+        layout.separator()
         
         # Parse enabled strips
         enabled_names = set(s.enabled_strips.split(',')) if s.enabled_strips else set()
+        enabled_names.discard('')
         
-        layout.label(text="Select tracks to display:", icon='SOUND')
-        layout.separator()
+        # Reorder strips based on strip_order
+        strip_order = s.strip_order.split(',') if s.strip_order else []
+        ordered_strips = []
+        strip_dict = {strip.name: strip for strip in strips}
         
+        for name in strip_order:
+            if name in strip_dict:
+                ordered_strips.append(strip_dict[name])
+        
+        # Add strips not in order
+        for strip in strips:
+            if strip not in ordered_strips:
+                ordered_strips.append(strip)
+        
+        # Create rows with checkbox and color picker
         col = layout.column(align=True)
-        for i, strip in enumerate(sound_strips):
+        for i, strip in enumerate(ordered_strips):
             row = col.row(align=True)
             
             # Compact move buttons - DOWN on left, UP on right
-            if i < len(sound_strips) - 1:
+            if i < len(ordered_strips) - 1:
                 op = row.operator("waveform.move_strip", text="", icon='TRIA_DOWN', emboss=False)
-                op.strip_index = i
+                op.strip_position = i
                 op.direction = 'DOWN'
             else:
                 row.label(text="", icon='BLANK1')
             
             if i > 0:
                 op = row.operator("waveform.move_strip", text="", icon='TRIA_UP', emboss=False)
-                op.strip_index = i
+                op.strip_position = i
                 op.direction = 'UP'
             else:
                 row.label(text="", icon='BLANK1')
             
             # Checkbox button
             is_enabled = strip.name in enabled_names
-            op = row.operator("waveform.toggle_strip", text=f"Ch {strip.channel}: {strip.name}",
+            op = row.operator("waveform.toggle_strip", text=strip.name, 
                             depress=is_enabled, emboss=True)
             op.strip_name = strip.name
             
@@ -1488,26 +1562,21 @@ class BB_OT_toggle_strip(bpy.types.Operator):
         
         # Parse current enabled strips
         enabled_names = set(s.enabled_strips.split(',')) if s.enabled_strips else set()
-        enabled_names.discard('')  # Remove empty strings
+        enabled_names.discard('')
         
-        
-        # Check if trying to disable the last enabled strip
-        is_currently_enabled = self.strip_name in enabled_names
-        if is_currently_enabled and len(enabled_names) == 1:
-            # Don't allow disabling the last strip
+        # Don't allow disabling the last strip
+        if len(enabled_names) == 1 and self.strip_name in enabled_names:
             self.report({'WARNING'}, 'At least one strip must be enabled')
             return {'CANCELLED'}
         
         # Toggle this strip
-        if is_currently_enabled:
+        if self.strip_name in enabled_names:
             enabled_names.remove(self.strip_name)
         else:
             enabled_names.add(self.strip_name)
         
-        # Save back to property (filter out any empty strings)
-        enabled_names.discard('')
-        s.enabled_strips = ','.join(enabled_names) if enabled_names else ""
-        
+        # Update property
+        s.enabled_strips = ','.join(enabled_names)
         
         # Rebuild immediately
         rebuild(context)
@@ -1519,51 +1588,57 @@ class BB_OT_move_strip(bpy.types.Operator):
     bl_label = "Move Strip"
     bl_options = {'INTERNAL'}
     
-    strip_index: bpy.props.IntProperty()
+    strip_position: bpy.props.IntProperty()  # Position in the display list
     direction: bpy.props.StringProperty()  # 'UP' or 'DOWN'
     
     def execute(self, context):
-        seq = context.scene.sequence_editor
         s = context.scene.waveform_settings
+        seq = context.scene.sequence_editor
         
         if not seq:
             return {'CANCELLED'}
         
-        # Get all sound strips in current display order
-        sound_strips = [strip for strip in seq.sequences if strip.type == 'SOUND']
+        # Get all sound strips
+        strips = [strip for strip in seq.sequences if strip.type == 'SOUND']
         
-        # If we have strip_order, use it, otherwise create it from current strips
-        if s.strip_order:
-            order_names = s.strip_order.split(',')
-            strip_dict = {strip.name: strip for strip in sound_strips}
-            ordered_strips = []
-            for name in order_names:
-                if name in strip_dict:
-                    ordered_strips.append(strip_dict[name])
-            # Add any new strips not in order
-            for strip in sound_strips:
-                if strip.name not in order_names:
-                    ordered_strips.append(strip)
-            sound_strips = ordered_strips
-        else:
-            # Initialize strip_order
-            s.strip_order = ','.join(strip.name for strip in sound_strips)
-        
-        if self.strip_index < 0 or self.strip_index >= len(sound_strips):
+        if not strips:
             return {'CANCELLED'}
         
-        # Swap positions based on direction
-        if self.direction == 'UP' and self.strip_index > 0:
-            sound_strips[self.strip_index], sound_strips[self.strip_index - 1] = \
-                sound_strips[self.strip_index - 1], sound_strips[self.strip_index]
-        elif self.direction == 'DOWN' and self.strip_index < len(sound_strips) - 1:
-            sound_strips[self.strip_index], sound_strips[self.strip_index + 1] = \
-                sound_strips[self.strip_index + 1], sound_strips[self.strip_index]
+        # Get strip order - if empty, initialize with current strip order
+        strip_order = s.strip_order.split(',') if s.strip_order else []
+        strip_order = [n for n in strip_order if n]  # Remove empty strings
+        
+        # Initialize strip_order if empty
+        if not strip_order:
+            strip_order = [strip.name for strip in strips]
+        
+        # Build ordered list
+        strip_dict = {strip.name: strip for strip in strips}
+        ordered_strips = []
+        for name in strip_order:
+            if name in strip_dict:
+                ordered_strips.append(strip_dict[name])
+        
+        # Add any missing strips
+        for strip in strips:
+            if strip not in ordered_strips:
+                ordered_strips.append(strip)
+        
+        if self.strip_position < 0 or self.strip_position >= len(ordered_strips):
+            return {'CANCELLED'}
+        
+        # Swap positions
+        if self.direction == 'UP' and self.strip_position > 0:
+            ordered_strips[self.strip_position], ordered_strips[self.strip_position - 1] = \
+                ordered_strips[self.strip_position - 1], ordered_strips[self.strip_position]
+        elif self.direction == 'DOWN' and self.strip_position < len(ordered_strips) - 1:
+            ordered_strips[self.strip_position], ordered_strips[self.strip_position + 1] = \
+                ordered_strips[self.strip_position + 1], ordered_strips[self.strip_position]
         else:
             return {'CANCELLED'}
         
         # Update strip_order
-        s.strip_order = ','.join(strip.name for strip in sound_strips)
+        s.strip_order = ','.join(strip.name for strip in ordered_strips)
         
         # Rebuild to update waveform with new order
         rebuild(context)
@@ -1571,15 +1646,14 @@ class BB_OT_move_strip(bpy.types.Operator):
 
 
 class BB_OT_select_audio_track(bpy.types.Operator):
+    """Select which audio tracks to display and customize their colors"""
     bl_idname = "waveform.select_audio_track"
     bl_label = "Select Tracks"
-    bl_description = "Choose which audio tracks to display"
-    bl_options = {'REGISTER', 'UNDO'}
     
     def get_audio_tracks(self, context):
-        """Get audio tracks from the current file"""
         s = context.scene.waveform_settings
-        if s.source == "FILE":
+        
+        if s.source == "FILE" and s.filepath:
             path = bpy.path.abspath(s.filepath)
         else:
             seq = context.scene.sequence_editor
@@ -1794,11 +1868,9 @@ def register():
 
 
 def unregister():
-    global _color_update_timer
-    
-    # Cancel any pending timer
-    if _color_update_timer is not None and _color_update_timer.is_alive:
-        _color_update_timer.cancel()
+    # Cancel any pending color update timers using the Blender-safe way
+    if bpy.app.timers.is_registered(schedule_color_update):
+        bpy.app.timers.unregister(schedule_color_update)
     
     clear_handlers()
     for c in reversed(classes):
