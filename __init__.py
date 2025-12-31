@@ -883,7 +883,7 @@ def rebuild(context):
                     enabled_sound_strips = reordered_strips
                 
                 # Find the earliest start and latest end
-                start_frame = min(s.frame_start for s in enabled_sound_strips)
+                start_frame = min(s.frame_final_start for s in enabled_sound_strips)
                 end_frame = max(s.frame_final_end for s in enabled_sound_strips)
                 sw_frames = end_frame - start_frame
                 
@@ -920,7 +920,7 @@ def rebuild(context):
                 # Single strip mode
                 strip = enabled_sound_strips[0]
                 path = bpy.path.abspath(strip.sound.filepath)
-                start_frame = strip.frame_start
+                start_frame = strip.frame_final_start
                 end_frame = strip.frame_final_end
                 sw_frames = end_frame - start_frame
                 
