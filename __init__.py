@@ -1,6 +1,7 @@
 import bpy, gpu, subprocess, tempfile
 from gpu_extras.batch import batch_for_shader
 from pathlib import Path
+import colorsys
 
 bl_info = {
     "name": "BB Waveform",
@@ -95,7 +96,7 @@ def get_audio_track_count(filepath):
     return len(tracks)
 
 
-def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_tracks=None, track_colors=None):
+def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_tracks=None, track_colors=None, all_red=False):
     """Generate separate waveform images for each enabled audio track with user-selected colors"""
     print(f"[MULTITRACK] Creating mixed waveform for: {filepath}")
     
@@ -123,7 +124,10 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
     # Generate a waveform for each track
     for i, track in enumerate(tracks):
         # Get color from track_colors if available
-        if track_colors:
+        if all_red:
+            # Force red when in "All Tracks" mode
+            color = (255, 80, 80)
+        elif track_colors:
             track_id = str(track['index'])
             color = None
             for item in track_colors:
@@ -230,7 +234,7 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
     return img, composite_path
 
 
-def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, strip_colors=None, fps=24.0):
+def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, strip_colors=None, fps=24.0, all_red=False):
     """Generate waveforms for multiple sequencer strips and composite them"""
     print(f"[MULTISTRIP] Creating mixed waveform for {len(strips)} strips")
     
@@ -240,7 +244,10 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
     # Generate a waveform for each strip
     for i, strip in enumerate(strips):
         # Get color from strip_colors if available
-        if strip_colors:
+        if all_red:
+            # Force red when in "All Channels" mode
+            color = (255, 80, 80)
+        elif strip_colors:
             color = None
             for item in strip_colors:
                 if item.name == strip.name:
@@ -562,6 +569,24 @@ def source_changed(s, context):
                         s.enabled_strips = strip.name
                         print(f"[SOURCE CHANGE] Auto-enabled first strip: {strip.name}")
                         break
+    elif s.source == "FILE":
+        # Initialize track colors with random colors if file exists
+        if s.filepath:
+            path = bpy.path.abspath(s.filepath)
+            if Path(path).exists():
+                tracks = get_audio_tracks_info(path)
+                for track in tracks:
+                    track_id = str(track['index'])
+                    existing = None
+                    for item in s.track_colors:
+                        if item.name == track_id:
+                            existing = item
+                            break
+                    if not existing:
+                        new_item = s.track_colors.add()
+                        new_item.name = track_id
+                        new_item.color = get_random_color()
+                        print(f"[SOURCE CHANGE] Initialized track {track_id} with random color")
     
     # Rebuild with new mode
     rebuild(context)
@@ -578,6 +603,29 @@ def waveform_enabled_changed(s, context):
                     s.enabled_strips = strip.name
                     print(f"[ENABLE] Auto-enabled first strip: {strip.name}")
                     break
+    
+    rebuild(context)
+
+
+def filepath_changed(s, context):
+    """Called when the file path changes in FILE mode"""
+    if s.source == "FILE" and s.filepath:
+        path = bpy.path.abspath(s.filepath)
+        if Path(path).exists():
+            # Initialize track colors with random colors for any new tracks
+            tracks = get_audio_tracks_info(path)
+            for track in tracks:
+                track_id = str(track['index'])
+                existing = None
+                for item in s.track_colors:
+                    if item.name == track_id:
+                        existing = item
+                        break
+                if not existing:
+                    new_item = s.track_colors.add()
+                    new_item.name = track_id
+                    new_item.color = get_random_color()
+                    print(f"[FILEPATH CHANGE] Initialized track {track_id} with random color")
     
     rebuild(context)
 
@@ -639,20 +687,25 @@ def schedule_color_update(context):
     _color_update_timer.start()
 
 
+_color_index = 0  # Track which color to assign next
+
+
 def get_random_color():
-    """Generate a random vibrant color"""
-    import random
-    colors = [
-        (1.0, 0.31, 0.31),   # Red
-        (0.31, 0.78, 1.0),   # Blue
-        (0.31, 1.0, 0.47),   # Green
-        (1.0, 0.78, 0.31),   # Yellow/Orange
-        (1.0, 0.39, 0.78),   # Pink
-        (0.59, 0.39, 1.0),   # Purple
-        (0.39, 1.0, 0.78),   # Cyan
-        (1.0, 0.59, 0.39),   # Coral
-    ]
-    return random.choice(colors)
+    """Generate colors with evenly distributed hues"""
+    global _color_index
+    
+    # Use golden ratio to distribute hues evenly
+    golden_ratio = 0.618033988749895
+    hue = (_color_index * golden_ratio) % 1.0
+    _color_index += 1
+    
+    # High saturation and value for vibrant colors
+    saturation = 0.8
+    value = 1.0
+    
+    # Convert HSV to RGB
+    r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+    return (r, g, b)
 
 
 def rebuild(context):
@@ -731,7 +784,8 @@ def rebuild(context):
                 
                 # Generate multistrip composite
                 img, img_path = generate_multistrip_waveform(enabled_sound_strips, start_frame, end_frame, 
-                                                            width=s.resolution, strip_colors=s.strip_colors)
+                                                            width=s.resolution, strip_colors=s.strip_colors,
+                                                            all_red=s.all_channels_red)
                 if not img:
                     print("ERROR generating multistrip waveform")
                     return
@@ -762,11 +816,14 @@ def rebuild(context):
                 sw_frames = end_frame - start_frame
                 
                 # Get the color for this strip
-                color = (1.0, 0.3, 0.3)  # Default red
-                for item in s.strip_colors:
-                    if item.name == strip.name:
-                        color = tuple(item.color)
-                        break
+                if s.all_channels_red:
+                    color = (1.0, 0.3, 0.3)  # Force red in all channels mode
+                else:
+                    color = (1.0, 0.3, 0.3)  # Default red
+                    for item in s.strip_colors:
+                        if item.name == strip.name:
+                            color = tuple(item.color)
+                            break
                 
                 print(f"[SEQ MODE] Using sequencer strip: {strip.name}")
                 print(f"[SEQ MODE] Start: {start_frame}, End: {end_frame}, Duration: {sw_frames} frames")
@@ -867,7 +924,8 @@ def rebuild(context):
                 # Generate mixed multi-track waveform
                 img, img_path = generate_multitrack_waveform(path, start_frame, width=s.resolution, 
                                                              enabled_tracks=s.enabled_tracks,
-                                                             track_colors=s.track_colors)
+                                                             track_colors=s.track_colors,
+                                                             all_red=s.all_tracks_red)
             else:
                 # Single track mode - find which track is enabled and get its color
                 audio_track_to_use = 0
@@ -877,11 +935,15 @@ def rebuild(context):
                         break
                 
                 # Get the color for this track
-                track_id = str(audio_track_to_use)
-                for item in s.track_colors:
-                    if item.name == track_id:
-                        color = tuple(item.color)
-                        break
+                if s.all_tracks_red:
+                    color = (1.0, 0.3, 0.3)  # Force red in all tracks mode
+                else:
+                    color = (1.0, 0.3, 0.3)  # Default red
+                    track_id = str(audio_track_to_use)
+                    for item in s.track_colors:
+                        if item.name == track_id:
+                            color = tuple(item.color)
+                            break
                 
                 # Generate single track waveform
                 img, img_path = generate_waveform_image(path, start_frame, color=color, width=s.resolution, audio_track=audio_track_to_use)
@@ -930,7 +992,7 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
     filepath: bpy.props.StringProperty(
         name="Audio File",
         subtype="FILE_PATH",
-        update=lambda s, c: rebuild(c)
+        update=lambda s, c: filepath_changed(s, c)
     )
     start_frame: bpy.props.IntProperty(
         name="Start Frame",
@@ -1003,6 +1065,16 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
         description="Comma-separated list of enabled strip names",
         default=""
     )
+    all_channels_red: bpy.props.BoolProperty(
+        name="All Channels Red Mode",
+        default=False,
+        description="When true, all sequencer strips display in red"
+    )
+    all_tracks_red: bpy.props.BoolProperty(
+        name="All Tracks Red Mode",
+        default=False,
+        description="When true, all audio tracks display in red"
+    )
     track_colors: bpy.props.CollectionProperty(
         type=BB_TrackColorItem,
         name="Track Colors"
@@ -1029,12 +1101,16 @@ def draw_ui(self, ctx):
         layout.prop(s, "source", expand=True)
         
         if s.source == "SEQ":
-            layout.operator("waveform.select_channel", icon='PRESET')
+            row = layout.row(align=True)
+            row.operator("waveform.all_channels", text="All Tracks", icon='ALIGN_JUSTIFY')
+            row.operator("waveform.select_channel", text="Select Tracks", icon='PRESET')
         
         if s.source == "FILE":
             layout.prop(s, "filepath")
             layout.prop(s, "start_frame")
-            layout.operator("waveform.select_audio_track", icon='PRESET')
+            row = layout.row(align=True)
+            row.operator("waveform.all_tracks", text="All Tracks", icon='ALIGN_JUSTIFY')
+            row.operator("waveform.select_audio_track", text="Select Tracks", icon='PRESET')
         
         layout.separator()
         layout.prop(s, "height_offset", slider=True, text="Height Scale")
@@ -1105,10 +1181,106 @@ class BB_OT_downscale(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BB_OT_all_channels(bpy.types.Operator):
+    bl_idname = "waveform.all_channels"
+    bl_label = "All Tracks"
+    bl_description = "Enable all sequencer strips in red"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        s = context.scene.waveform_settings
+        
+        if not context.scene.sequence_editor:
+            self.report({'ERROR'}, 'No sequence editor')
+            return {'CANCELLED'}
+        
+        seq = context.scene.sequence_editor
+        strip_names = []
+        
+        # Get all sound strips
+        for strip in seq.sequences:
+            if strip.type == 'SOUND':
+                strip_names.append(strip.name)
+                
+                # Initialize color entries with random colors if they don't exist
+                # But DON'T modify existing colors
+                found = False
+                for item in s.strip_colors:
+                    if item.name == strip.name:
+                        found = True
+                        break
+                if not found:
+                    new_item = s.strip_colors.add()
+                    new_item.name = strip.name
+                    new_item.color = get_random_color()
+        
+        if not strip_names:
+            self.report({'ERROR'}, 'No sound strips found')
+            return {'CANCELLED'}
+        
+        # Enable all strips and set red mode flag
+        s.enabled_strips = ','.join(strip_names)
+        s.all_channels_red = True  # Flag to display in red
+        
+        self.report({'INFO'}, f'Enabled {len(strip_names)} strips in red')
+        rebuild(context)
+        return {'FINISHED'}
+
+
+class BB_OT_all_tracks(bpy.types.Operator):
+    bl_idname = "waveform.all_tracks"
+    bl_label = "All Tracks"
+    bl_description = "Enable all audio tracks in red"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        s = context.scene.waveform_settings
+        
+        if not s.filepath:
+            self.report({'ERROR'}, 'No file selected')
+            return {'CANCELLED'}
+        
+        path = bpy.path.abspath(s.filepath)
+        if not Path(path).exists():
+            self.report({'ERROR'}, 'File does not exist')
+            return {'CANCELLED'}
+        
+        # Get track count
+        track_count = get_audio_track_count(path)
+        
+        if track_count == 0:
+            self.report({'ERROR'}, 'No audio tracks found')
+            return {'CANCELLED'}
+        
+        # Enable all tracks and initialize colors if needed
+        for i in range(track_count):
+            s.enabled_tracks[i] = True
+            
+            # Initialize color entries with random colors if they don't exist
+            # But DON'T modify existing colors
+            track_id = str(i)
+            found = False
+            for item in s.track_colors:
+                if item.name == track_id:
+                    found = True
+                    break
+            if not found:
+                new_item = s.track_colors.add()
+                new_item.name = track_id
+                new_item.color = get_random_color()
+        
+        # Set the all_tracks_red flag to display in red
+        s.all_tracks_red = True
+        
+        self.report({'INFO'}, f'Enabled {track_count} tracks in red')
+        rebuild(context)
+        return {'FINISHED'}
+
+
 class BB_OT_select_channel(bpy.types.Operator):
     bl_idname = "waveform.select_channel"
-    bl_label = "Select Channel"
-    bl_description = "Choose which sequencer channel to use for waveform"
+    bl_label = "Select Tracks"
+    bl_description = "Choose which sequencer strips to use for waveform"
     bl_options = {'REGISTER', 'UNDO'}
     
     def get_sound_strips(self, context):
@@ -1137,6 +1309,8 @@ class BB_OT_select_channel(bpy.types.Operator):
         if not s.enabled_strips:
             s.enabled_strips = sound_strips[0].name
         
+        # Only create color entries for new strips - preserve all existing colors
+        # This MUST happen BEFORE clearing the all_channels_red flag
         for strip in sound_strips:
             existing = None
             for item in s.strip_colors:
@@ -1148,6 +1322,12 @@ class BB_OT_select_channel(bpy.types.Operator):
                 new_item.name = strip.name
                 new_item.color = get_random_color()
         
+        # Clear the all_channels_red flag - we're in select mode now
+        s.all_channels_red = False
+        
+        # Rebuild waveform immediately with the new colors
+        rebuild(context)
+        
         return context.window_manager.invoke_popup(self, width=350)
     
     def draw(self, context):
@@ -1158,7 +1338,7 @@ class BB_OT_select_channel(bpy.types.Operator):
         # Parse enabled strips
         enabled_names = set(s.enabled_strips.split(',')) if s.enabled_strips else set()
         
-        layout.label(text="Select sequencer strips:", icon='SOUND')
+        layout.label(text="Select tracks to display:", icon='SOUND')
         layout.separator()
         
         col = layout.column(align=True)
@@ -1233,8 +1413,8 @@ class BB_OT_toggle_strip(bpy.types.Operator):
 
 class BB_OT_select_audio_track(bpy.types.Operator):
     bl_idname = "waveform.select_audio_track"
-    bl_label = "Select Audio Track"
-    bl_description = "Choose which audio track to use from the file"
+    bl_label = "Select Tracks"
+    bl_description = "Choose which audio tracks to display"
     bl_options = {'REGISTER', 'UNDO'}
     
     def get_audio_tracks(self, context):
@@ -1267,6 +1447,9 @@ class BB_OT_select_audio_track(bpy.types.Operator):
         
         # Initialize colors for tracks that don't have them yet
         s = context.scene.waveform_settings
+        
+        # Only create color entries for new tracks - preserve all existing colors
+        # This MUST happen BEFORE clearing the all_tracks_red flag
         for track in tracks:
             track_id = str(track['index'])
             existing = None
@@ -1279,6 +1462,12 @@ class BB_OT_select_audio_track(bpy.types.Operator):
                 new_item.name = track_id
                 new_item.color = get_random_color()
         
+        # Clear the all_tracks_red flag - we're in select mode now
+        s.all_tracks_red = False
+        
+        # Rebuild waveform immediately with the new colors
+        rebuild(context)
+        
         return context.window_manager.invoke_popup(self, width=350)
     
     def draw(self, context):
@@ -1286,7 +1475,7 @@ class BB_OT_select_audio_track(bpy.types.Operator):
         tracks = self.get_audio_tracks(context)
         s = context.scene.waveform_settings
         
-        layout.label(text="Select audio tracks to display:", icon='SOUND')
+        layout.label(text="Select tracks to display:", icon='SOUND')
         layout.separator()
         
         # Create rows with checkbox and color picker
@@ -1361,6 +1550,7 @@ class BB_OT_toggle_track(bpy.types.Operator):
 
 classes = (BB_TrackColorItem, BB_StripColorItem, BB_WaveformSettings, 
            BB_PT_dopesheet, BB_PT_graph, 
+           BB_OT_all_channels, BB_OT_all_tracks,
            BB_OT_select_channel, BB_OT_toggle_strip,
            BB_OT_select_audio_track, BB_OT_toggle_track)
 
