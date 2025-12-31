@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "bb_waveform"
+version = "1.0.0"
+name = "BB Waveform"
+tagline = "Display audio waveforms in timeline, dopesheet, and graph editors"
+maintainer = "Blender Bob & Claude.ai"
+type = "add-on"
+
+tags = ["Animation", "Sequencer", "User Interface"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Access to read audio files and generate waveform images"
+network = "Uses ffmpeg to process audio files"
+
+[build]
+paths_exclude_pattern = [
+  "/__pycache__/",
+  "*.pyc",
+]

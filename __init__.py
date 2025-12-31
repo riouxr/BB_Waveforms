@@ -1019,6 +1019,11 @@ def draw_ui(self, ctx):
     
     layout.prop(s, "enabled")
     
+    layout.separator()
+    layout.label(text="Show in:")
+    layout.prop(s, "show_ds")
+    layout.prop(s, "show_graph")
+    
     if s.enabled:
         layout.separator()
         layout.prop(s, "source", expand=True)
@@ -1030,11 +1035,6 @@ def draw_ui(self, ctx):
             layout.prop(s, "filepath")
             layout.prop(s, "start_frame")
             layout.operator("waveform.select_audio_track", icon='PRESET')
-        
-        layout.separator()
-        layout.label(text="Show in:")
-        layout.prop(s, "show_ds")
-        layout.prop(s, "show_graph")
         
         layout.separator()
         layout.prop(s, "height_offset", slider=True, text="Height Scale")
