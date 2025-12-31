@@ -80,13 +80,10 @@ def get_audio_tracks_info(filepath):
                 }
                 tracks.append(track_info)
             
-            print(f"[AUDIO TRACKS] Found {len(tracks)} audio track(s)")
             return tracks
         else:
-            print(f"[AUDIO TRACKS] Could not detect tracks")
             return []
     except Exception as e:
-        print(f"[AUDIO TRACKS] Error detecting: {e}")
         return []
 
 
@@ -98,7 +95,6 @@ def get_audio_track_count(filepath):
 
 def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_tracks=None, track_colors=None, all_red=False, track_order=None):
     """Generate separate waveform images for each enabled audio track with user-selected colors"""
-    print(f"[MULTITRACK] Creating mixed waveform for: {filepath}")
     
     # Get all audio tracks
     all_tracks = get_audio_tracks_info(filepath)
@@ -128,9 +124,7 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
             if track not in reordered_tracks:
                 reordered_tracks.append(track)
         tracks = reordered_tracks
-        print(f"[MULTITRACK] Reordered tracks: {[t['index'] for t in tracks]}")
     
-    print(f"[MULTITRACK] Processing {len(tracks)} enabled track(s)")
     
     temp_dir = Path(tempfile.gettempdir())
     waveform_files = []
@@ -172,11 +166,9 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
             '-y', str(output_path)
         ]
         
-        print(f"[MULTITRACK] Generating track {track_index} with color #{hex_color}...")
         ret = subprocess.call(cmd)
         
         if ret != 0:
-            print(f"[MULTITRACK] Warning: Failed to generate track {track_index}")
             continue
         
         if output_path.exists():
@@ -191,7 +183,6 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
     # We want: Track2 on top visually (like Photoshop layers)
     # ffmpeg: [0] is bottom, [N] is top
     # waveform_files is [Track1, Track2], so Track2 will be on top - perfect!
-    print(f"[MULTITRACK] Compositing order (bottom to top): {[f.name for f in waveform_files]}")
     
     # Composite all waveforms using ffmpeg
     composite_path = temp_dir / 'blender_waveform_mixed.png'
@@ -222,7 +213,6 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
                 filter_parts.append(f'[tmp{i+1}];')
         
         filter_str = ''.join(filter_parts)
-        print(f"[MULTITRACK] Filter: {filter_str}")
         
         cmd = ['ffmpeg'] + inputs + [
             '-hide_banner',
@@ -232,7 +222,6 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
             '-y', str(composite_path)
         ]
         
-        print(f"[MULTITRACK] Compositing {len(waveform_files)} tracks...")
         ret = subprocess.call(cmd)
         
         if ret != 0:
@@ -262,14 +251,12 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
     img = bpy.data.images.load(str(composite_path), check_existing=False)
     img.name = img_name
     
-    print(f"[MULTITRACK] Success! Mixed waveform size: {img.size[0]}x{img.size[1]}")
     
     return img, composite_path
 
 
 def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, strip_colors=None, fps=24.0, all_red=False):
     """Generate waveforms for multiple sequencer strips and composite them"""
-    print(f"[MULTISTRIP] Creating mixed waveform for {len(strips)} strips")
     
     temp_dir = Path(tempfile.gettempdir())
     waveform_files = []
@@ -309,11 +296,9 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
             '-y', str(output_path)
         ]
         
-        print(f"[MULTISTRIP] Generating strip '{strip.name}' with color #{hex_color}...")
         ret = subprocess.call(cmd)
         
         if ret != 0:
-            print(f"[MULTISTRIP] Warning: Failed to generate strip {strip.name}")
             continue
         
         if output_path.exists():
@@ -324,7 +309,6 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
         return None, None
     
     # DON'T reverse - lower in the UI list should be on top
-    print(f"[MULTISTRIP] Compositing order (bottom to top): {[f.name for f in waveform_files]}")
     
     # Composite all waveforms using ffmpeg (same as multitrack)
     composite_path = temp_dir / 'blender_waveform_strips_mixed.png'
@@ -355,7 +339,6 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
                 filter_parts.append(f'[tmp{i+1}];')
         
         filter_str = ''.join(filter_parts)
-        print(f"[MULTISTRIP] Filter: {filter_str}")
         
         cmd = ['ffmpeg'] + inputs + [
             '-hide_banner',
@@ -365,7 +348,6 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
             '-y', str(composite_path)
         ]
         
-        print(f"[MULTISTRIP] Compositing {len(waveform_files)} strips...")
         ret = subprocess.call(cmd)
         
         if ret != 0:
@@ -395,17 +377,12 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
     img = bpy.data.images.load(str(composite_path), check_existing=False)
     img.name = img_name
     
-    print(f"[MULTISTRIP] Success! Mixed waveform size: {img.size[0]}x{img.size[1]}")
     
     return img, composite_path
 
 
 def generate_waveform_image(filepath, start_frame, color=(1, 0.3, 0.3), width=4000, audio_track=0):
     """Generate waveform image using ffmpeg"""
-    print(f"[GENERATE] Creating waveform for: {filepath}")
-    print(f"[GENERATE] Resolution: {width}x1000")
-    print(f"[GENERATE] Audio track: {audio_track}")
-    print(f"[GENERATE] This may take a moment for large files...")
     
     temp_dir = Path(tempfile.gettempdir())
     output_path = temp_dir / 'blender_waveform.png'
@@ -423,21 +400,17 @@ def generate_waveform_image(filepath, start_frame, color=(1, 0.3, 0.3), width=40
         '-y', str(output_path)
     ]
     
-    print(f"[FFMPEG] Processing audio...")
     import time
     start_time = time.time()
     
     ret = subprocess.call(cmd)
     
     elapsed = time.time() - start_time
-    print(f"[FFMPEG] Completed in {elapsed:.2f} seconds")
     
     if ret != 0:
-        print(f"[ERROR] ffmpeg failed with code {ret}")
         return None, None
     
     if not output_path.exists():
-        print(f"[ERROR] Output not created at {output_path}")
         return None, None
     
     img_name = 'waveform_temp'
@@ -448,14 +421,12 @@ def generate_waveform_image(filepath, start_frame, color=(1, 0.3, 0.3), width=40
         try:
             old_img.user_clear()
             bpy.data.images.remove(old_img)
-            print(f"[GENERATE] Removed old waveform image")
         except:
             pass
     
     img = bpy.data.images.load(str(output_path), check_existing=False)
     img.name = img_name
     
-    print(f"[GENERATE] Success! Image size: {img.size[0]}x{img.size[1]}")
     
     return img, output_path
 
@@ -545,29 +516,24 @@ def clear_handlers():
         except:
             pass
     _handlers.clear()
-    print("[HANDLER] cleared")
 
 
 def setup_handlers(context):
-    print("[HANDLER] setting up")
     s = context.scene.waveform_settings
     clear_handlers()
     
     if not s.enabled:
-        print("[HANDLER] disabled")
         return
     
     args = (None, context)
     
     if s.show_ds:
-        print("  adding Dope/Timeline")
         h = bpy.types.SpaceDopeSheetEditor.draw_handler_add(
             draw_callback, args, "WINDOW", "POST_PIXEL"
         )
         _handlers.append((bpy.types.SpaceDopeSheetEditor, h))
     
     if s.show_graph:
-        print("  adding Graph Editor")
         h = bpy.types.SpaceGraphEditor.draw_handler_add(
             draw_callback, args, "WINDOW", "POST_PIXEL"
         )
@@ -594,7 +560,6 @@ def source_changed(s, context):
     """Called when switching between FILE and SEQ mode"""
     global _waveform_image, _waveform_coords
     
-    print(f"[SOURCE CHANGE] Switching to {s.source} mode")
     
     # Clear current waveform display
     _waveform_image = None
@@ -612,7 +577,6 @@ def source_changed(s, context):
                 for strip in seq.sequences:
                     if strip.type == 'SOUND':
                         s.enabled_strips = strip.name
-                        print(f"[SOURCE CHANGE] Auto-enabled first strip: {strip.name}")
                         break
     elif s.source == "FILE":
         # Initialize track colors with random colors if file exists
@@ -631,7 +595,6 @@ def source_changed(s, context):
                         new_item = s.track_colors.add()
                         new_item.name = track_id
                         new_item.color = get_random_color()
-                        print(f"[SOURCE CHANGE] Initialized track {track_id} with random color")
     
     # Rebuild with new mode
     rebuild(context)
@@ -646,7 +609,6 @@ def waveform_enabled_changed(s, context):
             for strip in seq.sequences:
                 if strip.type == 'SOUND':
                     s.enabled_strips = strip.name
-                    print(f"[ENABLE] Auto-enabled first strip: {strip.name}")
                     break
     
     rebuild(context)
@@ -670,7 +632,6 @@ def filepath_changed(s, context):
                     new_item = s.track_colors.add()
                     new_item.name = track_id
                     new_item.color = get_random_color()
-                    print(f"[FILEPATH CHANGE] Initialized track {track_id} with random color")
     
     rebuild(context)
 
@@ -763,7 +724,6 @@ def rebuild(context):
     _rebuilding = True
     
     try:
-        print("\n=== REBUILD ===")
         s = context.scene.waveform_settings
         
         # Sync resolution_level with resolution (in case resolution was changed directly)
@@ -771,7 +731,6 @@ def rebuild(context):
             s.resolution_level = max(1, s.resolution // 4000)
         
         if not s.enabled:
-            print("Disabled — clearing")
             clear_handlers()
             _waveform_image = None
             _waveform_coords = None
@@ -787,15 +746,12 @@ def rebuild(context):
         if s.source == "SEQ":
             seq = context.scene.sequence_editor
             if not seq:
-                print("No sequence editor")
                 return
             
             # Parse enabled strips
             enabled_names = set(s.enabled_strips.split(',')) if s.enabled_strips else set()
             enabled_names.discard('')
             
-            print(f"[SEQ MODE DEBUG] enabled_strips string: '{s.enabled_strips}'")
-            print(f"[SEQ MODE DEBUG] enabled_names set: {enabled_names}")
             
             # Get all sound strips - create a dict for lookup
             all_sound_strips = []
@@ -818,23 +774,18 @@ def rebuild(context):
                     if strip.name in enabled_names:
                         enabled_sound_strips.append(strip)
             
-            print(f"[SEQ MODE DEBUG] Found {len(enabled_sound_strips)} enabled strips out of {len(all_sound_strips)} total sound strips")
-            print(f"[SEQ MODE DEBUG] Ordered strip names: {[s.name for s in enabled_sound_strips]}")
             
             # If no valid strips are enabled but we have sound strips, enable the first one
             if not enabled_sound_strips and all_sound_strips:
                 first_strip = all_sound_strips[0]
                 s.enabled_strips = first_strip.name
                 enabled_sound_strips = [first_strip]
-                print(f"[SEQ MODE] No valid strips enabled, auto-enabled: {first_strip.name}")
             
             if not enabled_sound_strips:
-                print("No enabled sound strips")
                 return
             
             # If multiple strips, use multitrack mode
             if len(enabled_sound_strips) > 1:
-                print(f"[SEQ MODE] Multiple strips mode: {len(enabled_sound_strips)} strips")
                 
                 # Reorder strips based on strip_order
                 if s.strip_order:
@@ -849,7 +800,6 @@ def rebuild(context):
                         if strip not in reordered_strips:
                             reordered_strips.append(strip)
                     enabled_sound_strips = reordered_strips
-                    print(f"[SEQ MODE] Reordered strips: {[s.name for s in enabled_sound_strips]}")
                 
                 # Find the earliest start and latest end
                 start_frame = min(s.frame_start for s in enabled_sound_strips)
@@ -873,7 +823,6 @@ def rebuild(context):
                     (start_frame, 100)
                 )
                 
-                print(f"[COORDS] Start={start_frame}, End={start_frame + sw_frames}, Duration={sw_frames} frames")
                 
                 setup_handlers(context)
                 
@@ -899,14 +848,10 @@ def rebuild(context):
                             color = tuple(item.color)
                             break
                 
-                print(f"[SEQ MODE] Using sequencer strip: {strip.name}")
-                print(f"[SEQ MODE] Start: {start_frame}, End: {end_frame}, Duration: {sw_frames} frames")
-                print(f"[SEQ MODE] Path: {path}")
         else:
             path = bpy.path.abspath(s.filepath)
             start_frame = s.start_frame
             
-            print(f"Using external file @ frame {start_frame}")
             
             # Remove old strips first
             remove_waveform_strips(context)
@@ -925,7 +870,6 @@ def rebuild(context):
             if existing_strip:
                 # Use the actual strip's duration
                 sw_frames = existing_strip.frame_final_end - existing_strip.frame_final_start
-                print(f"Found existing strip in sequencer, using its duration: {sw_frames} frames")
             else:
                 # Calculate from audio file
                 try:
@@ -948,9 +892,6 @@ def rebuild(context):
                         temp_seq.sequences.remove(temp_strip)
                     
                     sw_frames = round(duration_seconds * fps)
-                    print(f"[DEBUG] Sound duration: {duration_seconds:.4f}s")
-                    print(f"[DEBUG] Scene FPS: {context.scene.render.fps} / {context.scene.render.fps_base} = {fps}")
-                    print(f"[DEBUG] Calculated frames: {sw_frames}")
                 except Exception as e:
                     print(f"Error loading sound: {e}")
                     import traceback
@@ -973,15 +914,11 @@ def rebuild(context):
                 except Exception as e:
                     print(f"Error adding to sequencer: {e}")
         
-        print(f"Resolved path: {path}")
         
         if not Path(path).exists():
             print("ERROR — File does NOT exist")
             return
         
-        print(f"\n{'='*60}")
-        print(f"GENERATING WAVEFORM - Please wait...")
-        print(f"Resolution: {s.resolution}px")
         print(f"{'='*60}\n")
         
         # Check if we should use multitrack mode (only for FILE mode with multiple audio tracks)
@@ -1040,7 +977,6 @@ def rebuild(context):
             (start_frame, 100)
         )
         
-        print(f"[COORDS] Start={start_frame}, End={start_frame + sw_frames}, Duration={sw_frames} frames")
         
         setup_handlers(context)
         
@@ -1516,36 +1452,24 @@ class BB_OT_toggle_strip(bpy.types.Operator):
         enabled_names = set(s.enabled_strips.split(',')) if s.enabled_strips else set()
         enabled_names.discard('')  # Remove empty strings
         
-        print(f"[STRIP TOGGLE DEBUG] Before toggle:")
-        print(f"  enabled_strips string: '{s.enabled_strips}'")
-        print(f"  enabled_names set: {enabled_names}")
-        print(f"  enabled count: {len(enabled_names)}")
-        print(f"  Toggling strip: '{self.strip_name}'")
-        print(f"  Is this strip currently enabled? {self.strip_name in enabled_names}")
         
         # Check if trying to disable the last enabled strip
         is_currently_enabled = self.strip_name in enabled_names
         if is_currently_enabled and len(enabled_names) == 1:
             # Don't allow disabling the last strip
             self.report({'WARNING'}, 'At least one strip must be enabled')
-            print(f"[STRIP TOGGLE] Cannot disable last strip")
             return {'CANCELLED'}
         
         # Toggle this strip
         if is_currently_enabled:
             enabled_names.remove(self.strip_name)
-            print(f"[STRIP TOGGLE] Disabled: {self.strip_name}")
         else:
             enabled_names.add(self.strip_name)
-            print(f"[STRIP TOGGLE] Enabled: {self.strip_name}")
         
         # Save back to property (filter out any empty strings)
         enabled_names.discard('')
         s.enabled_strips = ','.join(enabled_names) if enabled_names else ""
         
-        print(f"[STRIP TOGGLE DEBUG] After toggle:")
-        print(f"  enabled_strips string: '{s.enabled_strips}'")
-        print(f"  enabled_names set: {enabled_names}")
         
         # Rebuild immediately
         rebuild(context)
@@ -1762,7 +1686,6 @@ class BB_OT_toggle_track(bpy.types.Operator):
         # Toggle the track
         s.enabled_tracks[self.track_index] = not s.enabled_tracks[self.track_index]
         
-        print(f"[TRACK TOGGLE] Track {self.track_index} now {'enabled' if s.enabled_tracks[self.track_index] else 'disabled'}")
         
         # Rebuild immediately
         rebuild(context)
