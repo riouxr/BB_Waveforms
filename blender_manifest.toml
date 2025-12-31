@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "bb_waveform"
-version = "1.1.0"
+version = "1.2.0"
 name = "BB Waveform"
-tagline = "Display audio waveforms with FFmpeg auto-install"
+tagline = "Display audio waveforms with FFmpeg auto-install (Blender 4.2-5.0+)"
 maintainer = "Blender Bob & Claude.ai"
 type = "add-on"
 

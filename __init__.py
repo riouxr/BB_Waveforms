@@ -12,10 +12,10 @@ import re
 bl_info = {
     "name": "BB Waveform",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "Dopesheet Editor, Graph Editor > UI > BB Waveform",
-    "description": "Display audio waveforms in timeline, dopesheet, and graph editors with FFmpeg auto-install",
+    "description": "Display audio waveforms in timeline, dopesheet, and graph editors with FFmpeg auto-install. Compatible with Blender 4.2-5.0+",
     "category": "Animation",
 }
 
@@ -37,6 +37,18 @@ _color_index = 0  # Track which color to assign next
 def get_addon_name():
     """Get the addon name/package reliably"""
     return __name__
+
+
+def get_sequences(seq_editor):
+    """Get sequences from SequenceEditor - compatible with Blender 4.x and 5.0+
+    Blender 5.0 changed the API structure for accessing sequences"""
+    # Try different possible attribute names used across versions
+    for attr in ['sequences_all', 'sequences', 'strips', 'all_sequences']:
+        if hasattr(seq_editor, attr):
+            return getattr(seq_editor, attr)
+    
+    # Fallback to empty list if attribute not found
+    return []
 
 
 def get_ffmpeg_storage_path():
@@ -175,14 +187,14 @@ def find_empty_channel(seq, start_frame, duration):
     """Find an empty channel in the sequencer that can fit the audio strip"""
     for channel in range(1, 33):
         conflict = False
-        for strip in seq.sequences:
+        for strip in get_sequences(seq):
             if strip.channel == channel:
                 if not (strip.frame_final_end <= start_frame or strip.frame_final_start >= start_frame + duration):
                     conflict = True
                     break
         if not conflict:
             return channel
-    max_channel = max([s.channel for s in seq.sequences], default=0)
+    max_channel = max([s.channel for s in get_sequences(seq)], default=0)
     return max_channel + 1
 
 
@@ -670,7 +682,7 @@ def draw_callback(self, context):
             return
         # Try to access the image to see if it's still valid
         _ = _waveform_image.size
-    except (ReferenceError, AttributeError):
+    except (ReferenceError, AttributeError) as e:
         # Image has been removed, clear it
         _waveform_image = None
         return
@@ -752,6 +764,7 @@ def setup_handlers(context):
     s = context.scene.waveform_settings
     clear_handlers()
     
+    
     if not s.enabled:
         return
     
@@ -768,6 +781,7 @@ def setup_handlers(context):
             draw_callback, args, "WINDOW", "POST_PIXEL"
         )
         _handlers.append((bpy.types.SpaceGraphEditor, h))
+    
 
 
 def remove_waveform_strips(context):
@@ -777,12 +791,12 @@ def remove_waveform_strips(context):
     
     seq = context.scene.sequence_editor
     strips_to_remove = []
-    for strip in seq.sequences:
+    for strip in get_sequences(seq):
         if strip.type == 'SOUND' and strip.name.startswith("Waveform Audio"):
             strips_to_remove.append(strip)
     
     for strip in strips_to_remove:
-        seq.sequences.remove(strip)
+        get_sequences(seq).remove(strip)
 
 
 def source_changed(s, context):
@@ -803,7 +817,7 @@ def source_changed(s, context):
         if not s.enabled_strips:
             seq = context.scene.sequence_editor
             if seq:
-                for strip in seq.sequences:
+                for strip in get_sequences(seq):
                     if strip.type == 'SOUND':
                         s.enabled_strips = strip.name
                         break
@@ -835,7 +849,7 @@ def waveform_enabled_changed(s, context):
     if s.enabled and s.source == "SEQ" and not s.enabled_strips:
         seq = context.scene.sequence_editor
         if seq:
-            for strip in seq.sequences:
+            for strip in get_sequences(seq):
                 if strip.type == 'SOUND':
                     s.enabled_strips = strip.name
                     break
@@ -967,6 +981,7 @@ def rebuild(context):
         if s.resolution >= BASE_WAVEFORM_WIDTH:
             s.resolution_level = max(1, s.resolution // BASE_WAVEFORM_WIDTH)
         
+        
         if not s.enabled:
             clear_handlers()
             _waveform_image = None
@@ -993,7 +1008,7 @@ def rebuild(context):
             # Get all sound strips - create a dict for lookup
             all_sound_strips = []
             strip_dict = {}
-            for strip in seq.sequences:
+            for strip in get_sequences(seq):
                 if strip.type == 'SOUND':
                     all_sound_strips.append(strip)
                     strip_dict[strip.name] = strip
@@ -1102,7 +1117,7 @@ def rebuild(context):
             user_strip_with_same_file = None
             if context.scene.sequence_editor:
                 seq = context.scene.sequence_editor
-                for strip in seq.sequences:
+                for strip in get_sequences(seq):
                     if strip.type == 'SOUND':
                         strip_path = bpy.path.abspath(strip.sound.filepath)
                         if strip_path == path:
@@ -1134,9 +1149,9 @@ def rebuild(context):
                             if not context.scene.sequence_editor:
                                 context.scene.sequence_editor_create()
                             temp_seq = context.scene.sequence_editor
-                            temp_strip = temp_seq.sequences.new_sound("_temp_", path, 1, 1)
+                            temp_strip = temp_get_sequences(seq).new_sound("_temp_", path, 1, 1)
                             duration_seconds = (temp_strip.frame_final_end - temp_strip.frame_final_start) / fps
-                            temp_seq.sequences.remove(temp_strip)
+                            temp_get_sequences(seq).remove(temp_strip)
                         
                         sw_frames = round(duration_seconds * fps)
                     except Exception as e:
@@ -1153,7 +1168,7 @@ def rebuild(context):
             empty_channel = find_empty_channel(seq, start_frame, sw_frames)
             
             try:
-                strip = seq.sequences.new_sound("Waveform Audio", path, empty_channel, start_frame)
+                strip = get_sequences(seq).new_sound("Waveform Audio", path, empty_channel, start_frame)
                 # Update sw_frames with the actual strip duration
                 sw_frames = strip.frame_final_end - strip.frame_final_start
             except Exception as e:
@@ -1222,8 +1237,8 @@ def rebuild(context):
             img, img_path = generate_waveform_image(path, start_frame, color=color, width=waveform_width, audio_track=0)
         
         if not img:
-            print("ERROR generating waveform")
             return
+        
         
         _waveform_image = img
         
@@ -1236,6 +1251,7 @@ def rebuild(context):
         
         
         setup_handlers(context)
+        
         
         for area in context.screen.areas:
             area.tag_redraw()
@@ -1364,6 +1380,8 @@ class BB_PT_dopesheet(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = 'BB Waveform'
     
+    # No poll method - show in all DOPESHEET_EDITOR modes that have sidebars
+    
     def draw(self, context):
         layout = self.layout
         s = context.scene.waveform_settings
@@ -1430,7 +1448,7 @@ class BB_PT_dopesheet(bpy.types.Panel):
                 layout.label(text="No sequencer", icon='ERROR')
                 return
             
-            sound_strips = [s for s in seq.sequences if s.type == 'SOUND']
+            sound_strips = [s for s in get_sequences(seq) if s.type == 'SOUND']
             
             if not sound_strips:
                 layout.label(text="No audio strips in sequencer", icon='INFO')
@@ -1535,7 +1553,7 @@ class BB_PT_graph(bpy.types.Panel):
                 layout.label(text="No sequencer", icon='ERROR')
                 return
             
-            sound_strips = [s for s in seq.sequences if s.type == 'SOUND']
+            sound_strips = [s for s in get_sequences(seq) if s.type == 'SOUND']
             
             if not sound_strips:
                 layout.label(text="No audio strips in sequencer", icon='INFO')
@@ -1567,6 +1585,7 @@ class BB_PT_graph(bpy.types.Panel):
         box.prop(s, "resolution_level", text="Level")
 
 
+
 class BB_OT_select_channel(bpy.types.Operator):
     """Select which audio strips to display and customize their colors"""
     bl_idname = "waveform.select_channel"
@@ -1578,7 +1597,7 @@ class BB_OT_select_channel(bpy.types.Operator):
             return []
         
         strips = []
-        for strip in seq.sequences:
+        for strip in get_sequences(seq):
             if strip.type == 'SOUND':
                 strips.append(strip)
         
@@ -1730,7 +1749,7 @@ class BB_OT_move_strip(bpy.types.Operator):
             return {'CANCELLED'}
         
         # Get all sound strips
-        strips = [strip for strip in seq.sequences if strip.type == 'SOUND']
+        strips = [strip for strip in get_sequences(seq) if strip.type == 'SOUND']
         
         if not strips:
             return {'CANCELLED'}
@@ -2273,6 +2292,7 @@ classes = (BB_TrackColorItem, BB_StripColorItem, BB_WaveformSettings,
            BB_OT_select_channel, BB_OT_toggle_strip, BB_OT_move_strip,
            BB_OT_select_audio_track, BB_OT_toggle_track, BB_OT_move_track,
            BB_OT_download_ffmpeg, BB_OT_check_ffmpeg, BB_OT_remove_ffmpeg,
+           BB_OT_open_preferences,
            BB_WaveformPreferences)
 
 
@@ -2285,7 +2305,7 @@ def register():
 def unregister():
     global _pending_color_update
     
-    # Cancel any pending color update timers using the Blender-safe way
+    # Cancel any pending color update timers
     if _pending_color_update is not None:
         try:
             bpy.app.timers.unregister(delayed_color_rebuild)
