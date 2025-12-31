@@ -2,14 +2,20 @@ import bpy, gpu, subprocess, tempfile
 from gpu_extras.batch import batch_for_shader
 from pathlib import Path
 import colorsys
+import sys
+import os
+import urllib.request
+import shutil
+import ssl
+import re
 
 bl_info = {
-    "name": "BB Waveforms",
+    "name": "BB Waveform",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 0, 2),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
-    "location": "Dopesheet Editor, Graph Editor > UI > BB Waveforms",
-    "description": "Display audio waveforms in timeline, dopesheet, and graph editors",
+    "location": "Dopesheet Editor, Graph Editor > UI > BB Waveform",
+    "description": "Display audio waveforms in timeline, dopesheet, and graph editors with FFmpeg auto-install",
     "category": "Animation",
 }
 
@@ -28,13 +34,134 @@ _rebuilding = False
 _color_index = 0  # Track which color to assign next
 
 
-def check_ffmpeg_available():
-    """Check if FFmpeg is installed and available"""
+def get_addon_name():
+    """Get the addon name/package reliably"""
+    return __name__
+
+
+def get_ffmpeg_storage_path():
+    """Get persistent storage path for FFmpeg binaries (survives addon reinstall)"""
+    import platform
+    blender_version = f"{bpy.app.version[0]}.{bpy.app.version[1]}"
+    
+    if platform.system() == 'Windows':
+        base = Path(os.environ.get('APPDATA', Path.home())) / 'Blender Foundation' / 'Blender' / blender_version
+    elif platform.system() == 'Darwin':  # macOS
+        base = Path.home() / 'Library' / 'Application Support' / 'Blender' / blender_version
+    else:  # Linux
+        base = Path.home() / '.config' / 'blender' / blender_version
+    
+    storage = base / 'bb_waveform_ffmpeg'
+    storage.mkdir(parents=True, exist_ok=True)
+    return storage
+
+
+def get_ffmpeg_path():
+    """Get the FFmpeg executable path based on priority system"""
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+        # Try custom path first
+        prefs = bpy.context.preferences.addons[get_addon_name()].preferences
+        if prefs.ffmpeg_path and Path(prefs.ffmpeg_path).exists():
+            return prefs.ffmpeg_path
+    except:
+        pass
+    
+    # Try persistent storage (survives reinstall)
+    storage = get_ffmpeg_storage_path()
+    if sys.platform.startswith('win'):
+        ffmpeg_bin = storage / 'ffmpeg.exe'
+    else:
+        ffmpeg_bin = storage / 'ffmpeg'
+    
+    if ffmpeg_bin.exists():
+        return str(ffmpeg_bin)
+    
+    # Try addon folder (legacy location)
+    addon_loc = Path(__file__).parent
+    if sys.platform.startswith('win'):
+        ffmpeg_bin = addon_loc / 'ffmpeg.exe'
+    else:
+        ffmpeg_bin = addon_loc / 'ffmpeg'
+    
+    if ffmpeg_bin.exists():
+        return str(ffmpeg_bin)
+    
+    # Default to system PATH
+    return 'ffmpeg'
+
+
+def get_ffprobe_path():
+    """Get the FFprobe executable path based on priority system
+    Note: If ffprobe isn't available, ffmpeg can handle probing too"""
+    try:
+        # Try custom path first
+        prefs = bpy.context.preferences.addons[get_addon_name()].preferences
+        if prefs.ffmpeg_path and Path(prefs.ffmpeg_path).exists():
+            probe_dir = Path(prefs.ffmpeg_path).parent
+            probe_name = 'ffprobe.exe' if sys.platform.startswith('win') else 'ffprobe'
+            ffprobe_path = probe_dir / probe_name
+            if ffprobe_path.exists():
+                return str(ffprobe_path)
+            # Fallback to ffmpeg for probing
+            return prefs.ffmpeg_path
+    except:
+        pass
+    
+    # Try persistent storage (survives reinstall)
+    storage = get_ffmpeg_storage_path()
+    if sys.platform.startswith('win'):
+        ffprobe_bin = storage / 'ffprobe.exe'
+        ffmpeg_bin = storage / 'ffmpeg.exe'
+    else:
+        ffprobe_bin = storage / 'ffprobe'
+        ffmpeg_bin = storage / 'ffmpeg'
+    
+    if ffprobe_bin.exists():
+        return str(ffprobe_bin)
+    elif ffmpeg_bin.exists():
+        # Use ffmpeg for probing if ffprobe not available
+        return str(ffmpeg_bin)
+    
+    # Try addon folder (legacy location)
+    addon_loc = Path(__file__).parent
+    if sys.platform.startswith('win'):
+        ffprobe_bin = addon_loc / 'ffprobe.exe'
+        ffmpeg_bin = addon_loc / 'ffmpeg.exe'
+    else:
+        ffprobe_bin = addon_loc / 'ffprobe'
+        ffmpeg_bin = addon_loc / 'ffmpeg'
+    
+    if ffprobe_bin.exists():
+        return str(ffprobe_bin)
+    elif ffmpeg_bin.exists():
+        # Use ffmpeg for probing if ffprobe not available
+        return str(ffmpeg_bin)
+    
+    # Try system PATH
+    ffprobe_sys = shutil.which('ffprobe')
+    if ffprobe_sys:
+        return 'ffprobe'
+    
+    # Fallback to ffmpeg (most builds include probe functionality)
+    return 'ffmpeg'
+
+
+def check_ffmpeg_available():
+    """Check if FFmpeg is installed and available (ffprobe is optional)"""
+    try:
+        ffmpeg_path = get_ffmpeg_path()
+        subprocess.run([ffmpeg_path, '-version'], capture_output=True, check=True, timeout=5)
+        
+        # ffprobe is optional - just check if it exists
+        try:
+            ffprobe_path = get_ffprobe_path()
+            subprocess.run([ffprobe_path, '-version'], capture_output=True, check=True, timeout=5)
+        except:
+            # ffprobe not available, but that's okay - just won't have multi-track detection
+            pass
+        
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
 
@@ -63,7 +190,7 @@ def get_audio_tracks_info(filepath):
     """Get audio track information including index and codec name"""
     try:
         cmd = [
-            'ffprobe',
+            get_ffprobe_path(),
             '-v', 'error',
             '-select_streams', 'a',
             '-show_entries', 'stream=index,codec_name,channels:stream_tags',
@@ -101,12 +228,41 @@ def get_audio_tracks_info(filepath):
             
             return tracks
         else:
-            return []
+            # ffprobe failed, try fallback
+            return get_audio_tracks_info_fallback(filepath)
     except subprocess.TimeoutExpired:
-        print("[WARNING] ffprobe timeout")
-        return []
+        print("[WARNING] ffprobe timeout, using fallback")
+        return get_audio_tracks_info_fallback(filepath)
     except Exception as e:
-        print(f"[WARNING] ffprobe error: {e}")
+        print(f"[WARNING] ffprobe error: {e}, using fallback")
+        return get_audio_tracks_info_fallback(filepath)
+
+
+def get_audio_tracks_info_fallback(filepath):
+    """Fallback method using ffmpeg -i to detect audio tracks when ffprobe unavailable"""
+    try:
+        cmd = [get_ffmpeg_path(), '-i', str(filepath), '-hide_banner']
+        # ffmpeg outputs stream info to stderr
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        # Parse stderr for audio stream info (format: "Stream #0:1: Audio: aac")
+        tracks = []
+        audio_pattern = r'Stream #\d+:(\d+).*?: Audio: (\w+)'
+        
+        for match in re.finditer(audio_pattern, result.stderr):
+            stream_index = int(match.group(1))
+            codec = match.group(2)
+            tracks.append({
+                'index': stream_index,
+                'codec': codec,
+                'channels': 2,
+                'language': '',
+                'name': ''
+            })
+        
+        return tracks
+    except Exception as e:
+        print(f"[WARNING] Fallback audio track detection failed: {e}")
         return []
 
 
@@ -120,7 +276,7 @@ def get_audio_duration(filepath):
     """Get exact audio duration in seconds from ffprobe"""
     try:
         cmd = [
-            'ffprobe',
+            get_ffprobe_path(),
             '-v', 'error',
             '-show_entries', 'format=duration',
             '-of', 'json',
@@ -189,7 +345,7 @@ def generate_composite_waveform(waveform_files, output_path):
     # Build filter chain
     filter_str = build_overlay_filter(len(waveform_files))
     
-    cmd = ['ffmpeg'] + inputs + [
+    cmd = [get_ffmpeg_path()] + inputs + [
         '-hide_banner',
         '-loglevel', 'error',
         '-filter_complex', filter_str,
@@ -271,7 +427,7 @@ def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_trac
         track_index = track['index']
         
         cmd = [
-            'ffmpeg',
+            get_ffmpeg_path(),
             '-i', str(filepath),
             '-hide_banner',
             '-loglevel', 'error',
@@ -374,7 +530,7 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
         path = bpy.path.abspath(strip.sound.filepath)
         
         cmd = [
-            'ffmpeg',
+            get_ffmpeg_path(),
             '-i', str(path),
             '-hide_banner',
             '-loglevel', 'error',
@@ -451,7 +607,7 @@ def generate_waveform_image(filepath, start_frame, color=(1, 0.3, 0.3), width=40
     hex_color = rgb_to_hex(color)
     
     cmd = [
-        'ffmpeg',
+        get_ffmpeg_path(),
         '-i', str(filepath),
         '-hide_banner',
         '-loglevel', 'error',
@@ -1202,11 +1358,11 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
 
 
 class BB_PT_dopesheet(bpy.types.Panel):
-    bl_label = "BB Waveforms"
+    bl_label = "BB Waveform"
     bl_idname = "BB_PT_dopesheet"
     bl_space_type = 'DOPESHEET_EDITOR'
     bl_region_type = 'UI'
-    bl_category = 'Animation'
+    bl_category = 'BB Waveform'
     
     def draw(self, context):
         layout = self.layout
@@ -1218,11 +1374,12 @@ class BB_PT_dopesheet(bpy.types.Panel):
             box.alert = True
             col = box.column(align=True)
             col.label(text="FFmpeg Not Found!", icon='ERROR')
-            col.label(text="This addon requires FFmpeg")
-            col.label(text="and ffprobe to be installed")
-            col.label(text="and available in your PATH.")
-            col.separator()
-            col.label(text="Download from ffmpeg.org")
+            col.label(text="Install FFmpeg to use this addon")
+            
+            row = col.row(align=True)
+            row.operator('bb_waveform.download_ffmpeg', text='Auto-install', icon='IMPORT')
+            row.operator('bb_waveform.check_ffmpeg', text='Check Status', icon='INFO')
+            
             return
         
         layout.prop(s, "enabled", toggle=True)
@@ -1306,11 +1463,11 @@ class BB_PT_dopesheet(bpy.types.Panel):
 
 
 class BB_PT_graph(bpy.types.Panel):
-    bl_label = "BB Waveforms"
+    bl_label = "BB Waveform"
     bl_idname = "BB_PT_graph"
     bl_space_type = 'GRAPH_EDITOR'
     bl_region_type = 'UI'
-    bl_category = 'Animation'
+    bl_category = 'BB Waveform'
     
     def draw(self, context):
         layout = self.layout
@@ -1322,11 +1479,12 @@ class BB_PT_graph(bpy.types.Panel):
             box.alert = True
             col = box.column(align=True)
             col.label(text="FFmpeg Not Found!", icon='ERROR')
-            col.label(text="This addon requires FFmpeg")
-            col.label(text="and ffprobe to be installed")
-            col.label(text="and available in your PATH.")
-            col.separator()
-            col.label(text="Download from ffmpeg.org")
+            col.label(text="Install FFmpeg to use this addon")
+            
+            row = col.row(align=True)
+            row.operator('bb_waveform.download_ffmpeg', text='Auto-install', icon='IMPORT')
+            row.operator('bb_waveform.check_ffmpeg', text='Check Status', icon='INFO')
+            
             return
         
         layout.prop(s, "enabled", toggle=True)
@@ -1827,10 +1985,295 @@ class BB_OT_move_track(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# FFmpeg Management Operators and Preferences
+# Insert this code BEFORE the classes tuple
+
+class BB_OT_download_ffmpeg(bpy.types.Operator):
+    """Download and install FFmpeg in the addon folder"""
+    bl_idname = "bb_waveform.download_ffmpeg"
+    bl_label = "Auto-install FFmpeg"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    
+    def invoke(self, context, event):
+        # Determine platform-specific download URL
+        if sys.platform.startswith('win'):
+            # Note: These URLs from Pullusb repository may not have ffprobe
+            # If ffprobe fails, the addon will still work with ffmpeg only
+            self.release_url = 'https://github.com/Pullusb/static_bin/raw/main/ffmpeg/windows/ffmpeg.exe'
+            self.probe_url = 'https://github.com/Pullusb/static_bin/raw/main/ffmpeg/windows/ffprobe.exe'
+        elif sys.platform.startswith(('linux', 'freebsd')):
+            self.release_url = 'https://github.com/Pullusb/static_bin/raw/main/ffmpeg/linux/ffmpeg'
+            self.probe_url = 'https://github.com/Pullusb/static_bin/raw/main/ffmpeg/linux/ffprobe'
+        else:
+            self.release_url = 'https://github.com/Pullusb/static_bin/raw/main/ffmpeg/mac/ffmpeg'
+            self.probe_url = 'https://github.com/Pullusb/static_bin/raw/main/ffmpeg/mac/ffprobe'
+        
+        # Use persistent storage that survives addon reinstall
+        storage_loc = get_ffmpeg_storage_path()
+        self.ffmpeg_bin = storage_loc / Path(self.release_url).name
+        self.ffprobe_bin = storage_loc / Path(self.probe_url).name
+        self.exists = self.ffmpeg_bin.exists() and self.ffprobe_bin.exists()
+        
+        return context.window_manager.invoke_props_dialog(self, width=500)
+    
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column()
+        if self.exists:
+            col.label(text='FFmpeg is already in addon folder, delete and re-download? (80-100 MB)', icon='INFO')
+        else:
+            col.label(text='This will download FFmpeg static release in addon folder (80-100 MB)', icon='INFO')
+            col.label(text='Would you like to continue?')
+    
+    def execute(self, context):
+        if self.exists:
+            try:
+                self.ffmpeg_bin.unlink()
+                self.ffprobe_bin.unlink()
+            except:
+                pass
+        
+        if sys.platform.startswith(('linux', 'freebsd')):
+            ssl._create_default_https_context = ssl._create_unverified_context
+        
+        try:
+            # Download ffmpeg
+            self.report({'INFO'}, 'Downloading ffmpeg...')
+            with urllib.request.urlopen(self.release_url, timeout=60) as response, open(self.ffmpeg_bin, 'wb') as out_file:
+                shutil.copyfileobj(response, out_file)
+            
+            if not self.ffmpeg_bin.exists():
+                self.report({'ERROR'}, 'ffmpeg download failed')
+                return {'CANCELLED'}
+            
+            # Try to download ffprobe (optional - ffmpeg includes probing functionality)
+            self.report({'INFO'}, 'Downloading ffprobe...')
+            try:
+                with urllib.request.urlopen(self.probe_url, timeout=60) as response, open(self.ffprobe_bin, 'wb') as out_file:
+                    shutil.copyfileobj(response, out_file)
+            except Exception as probe_err:
+                # This is fine - ffmpeg can handle probing on its own
+                pass
+            
+            # Set permissions on Unix
+            if not sys.platform.startswith('win'):
+                import os
+                if self.ffmpeg_bin.exists():
+                    os.chmod(self.ffmpeg_bin, 0o755)
+                if self.ffprobe_bin.exists():
+                    os.chmod(self.ffprobe_bin, 0o755)
+            
+            # Report success
+            if self.ffmpeg_bin.exists():
+                prefs = context.preferences.addons[get_addon_name()].preferences
+                prefs.ffmpeg_path = str(self.ffmpeg_bin.resolve())
+                self.report({'INFO'}, 'FFmpeg installed successfully!')
+            else:
+                self.report({'ERROR'}, 'Download failed')
+                return {'CANCELLED'}
+                
+        except Exception as e:
+            self.report({'ERROR'}, f'Download failed: {str(e)}')
+            return {'CANCELLED'}
+        
+        return {'FINISHED'}
+
+
+class BB_OT_check_ffmpeg(bpy.types.Operator):
+    """Check FFmpeg availability"""
+    bl_idname = "bb_waveform.check_ffmpeg"
+    bl_label = "Check FFmpeg Status"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    
+    def invoke(self, context, event):
+        prefs = context.preferences.addons[get_addon_name()].preferences
+        
+        self.sys_ffmpeg = shutil.which('ffmpeg')
+        self.sys_ffprobe = shutil.which('ffprobe')
+        
+        self.custom_ffmpeg = None
+        self.custom_ffprobe = None
+        if prefs.ffmpeg_path and Path(prefs.ffmpeg_path).exists():
+            self.custom_ffmpeg = prefs.ffmpeg_path
+            custom_dir = Path(prefs.ffmpeg_path).parent
+            probe_name = 'ffprobe.exe' if sys.platform.startswith('win') else 'ffprobe'
+            probe_path = custom_dir / probe_name
+            if probe_path.exists():
+                self.custom_ffprobe = str(probe_path)
+        
+        # Check persistent storage location
+        storage_loc = get_ffmpeg_storage_path()
+        if sys.platform.startswith('win'):
+            storage_ffmpeg = storage_loc / 'ffmpeg.exe'
+            storage_ffprobe = storage_loc / 'ffprobe.exe'
+        else:
+            storage_ffmpeg = storage_loc / 'ffmpeg'
+            storage_ffprobe = storage_loc / 'ffprobe'
+        
+        self.storage_ffmpeg = str(storage_ffmpeg) if storage_ffmpeg.exists() else None
+        self.storage_ffprobe = str(storage_ffprobe) if storage_ffprobe.exists() else None
+        
+        return context.window_manager.invoke_props_dialog(self, width=550)
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        layout.label(text='FFmpeg Search Priority:', icon='INFO')
+        layout.label(text='1. Custom Path → 2. Persistent Storage → 3. System PATH')
+        layout.separator()
+        
+        if self.custom_ffmpeg:
+            box = layout.box()
+            col = box.column()
+            col.label(text='✓ Custom Path (WILL BE USED)', icon='CHECKMARK')
+            col.label(text=f'  ffmpeg: {self.custom_ffmpeg}')
+            if self.custom_ffprobe:
+                col.label(text=f'  ffprobe: {self.custom_ffprobe}')
+            else:
+                col.label(text='  ffprobe: NOT FOUND', icon='ERROR')
+        
+        if self.storage_ffmpeg:
+            box = layout.box()
+            col = box.column()
+            if not self.custom_ffmpeg:
+                col.label(text='✓ Persistent Storage (WILL BE USED)', icon='CHECKMARK')
+            else:
+                col.label(text='✓ Persistent Storage (available)', icon='DISCLOSURE_TRI_RIGHT')
+            col.label(text=f'  ffmpeg: {self.storage_ffmpeg}')
+            if self.storage_ffprobe:
+                col.label(text=f'  ffprobe: {self.storage_ffprobe}')
+            else:
+                col.label(text='  ffprobe: NOT FOUND', icon='ERROR')
+        
+        if self.sys_ffmpeg:
+            box = layout.box()
+            col = box.column()
+            if not self.custom_ffmpeg and not self.storage_ffmpeg:
+                col.label(text='✓ System PATH (WILL BE USED)', icon='CHECKMARK')
+            else:
+                col.label(text='✓ System PATH (available)', icon='DISCLOSURE_TRI_RIGHT')
+            col.label(text=f'  ffmpeg: {self.sys_ffmpeg}')
+            if self.sys_ffprobe:
+                col.label(text=f'  ffprobe: {self.sys_ffprobe}')
+            else:
+                col.label(text='  ffprobe: NOT FOUND', icon='ERROR')
+        
+        if not self.custom_ffmpeg and not self.storage_ffmpeg and not self.sys_ffmpeg:
+            box = layout.box()
+            box.alert = True
+            col = box.column()
+            col.label(text='✗ FFmpeg NOT FOUND', icon='ERROR')
+            col.label(text='Use Auto-install or manually install FFmpeg')
+    
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class BB_OT_remove_ffmpeg(bpy.types.Operator):
+    """Remove FFmpeg from persistent storage"""
+    bl_idname = "bb_waveform.remove_ffmpeg"
+    bl_label = "Remove FFmpeg"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    
+    def invoke(self, context, event):
+        storage_loc = get_ffmpeg_storage_path()
+        if sys.platform.startswith('win'):
+            self.ffmpeg_bin = storage_loc / 'ffmpeg.exe'
+            self.ffprobe_bin = storage_loc / 'ffprobe.exe'
+        else:
+            self.ffmpeg_bin = storage_loc / 'ffmpeg'
+            self.ffprobe_bin = storage_loc / 'ffprobe'
+        
+        self.exists = self.ffmpeg_bin.exists() or self.ffprobe_bin.exists()
+        
+        return context.window_manager.invoke_props_dialog(self, width=500)
+    
+    def draw(self, context):
+        layout = self.layout
+        if self.exists:
+            layout.label(text='Remove FFmpeg from persistent storage?', icon='ERROR')
+            if self.ffmpeg_bin.exists():
+                layout.label(text=f'  {self.ffmpeg_bin}')
+            if self.ffprobe_bin.exists():
+                layout.label(text=f'  {self.ffprobe_bin}')
+        else:
+            layout.label(text='No FFmpeg found in storage', icon='INFO')
+    
+    def execute(self, context):
+        removed = []
+        try:
+            if self.ffmpeg_bin.exists():
+                self.ffmpeg_bin.unlink()
+                removed.append('ffmpeg')
+            if self.ffprobe_bin.exists():
+                self.ffprobe_bin.unlink()
+                removed.append('ffprobe')
+            
+            if removed:
+                self.report({'INFO'}, f"Removed: {', '.join(removed)}")
+            else:
+                self.report({'INFO'}, 'Nothing to remove')
+                
+        except Exception as e:
+            self.report({'ERROR'}, f'Could not remove files: {str(e)}')
+            return {'CANCELLED'}
+        
+        return {'FINISHED'}
+
+
+class BB_OT_open_preferences(bpy.types.Operator):
+    """Open addon preferences"""
+    bl_idname = "bb_waveform.open_preferences"
+    bl_label = "Open Preferences"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    
+    def execute(self, context):
+        bpy.ops.screen.userpref_show('INVOKE_DEFAULT')
+        context.preferences.active_section = 'ADDONS'
+        
+        # For extensions, this doesn't work the same way, but at least opens preferences
+        return {'FINISHED'}
+
+
+class BB_WaveformPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+    
+    ffmpeg_path: bpy.props.StringProperty(
+        name="Custom FFmpeg Path",
+        description="Path to ffmpeg executable (leave empty to use addon folder or system PATH)",
+        subtype='FILE_PATH',
+        default=""
+    )
+    
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        
+        box = layout.box()
+        box.label(text='FFmpeg Installation:', icon='PLUGIN')
+        
+        col = box.column()
+        col.label(text='This addon requires FFmpeg to generate waveforms')
+        
+        row = col.row()
+        row.operator('bb_waveform.check_ffmpeg', text='Check Status', icon='INFO')
+        
+        row = col.row(align=True)
+        row.operator('bb_waveform.download_ffmpeg', text='Auto-install', icon='IMPORT')
+        row.operator('bb_waveform.remove_ffmpeg', text='Remove', icon='X')
+        
+        col.label(text='Or specify custom FFmpeg path:')
+        col.prop(self, 'ffmpeg_path', text='')
+        
+        col.label(text='Priority: Custom Path > Persistent Storage > System PATH', icon='INFO')
+
+
 classes = (BB_TrackColorItem, BB_StripColorItem, BB_WaveformSettings, 
            BB_PT_dopesheet, BB_PT_graph, 
            BB_OT_select_channel, BB_OT_toggle_strip, BB_OT_move_strip,
-           BB_OT_select_audio_track, BB_OT_toggle_track, BB_OT_move_track)
+           BB_OT_select_audio_track, BB_OT_toggle_track, BB_OT_move_track,
+           BB_OT_download_ffmpeg, BB_OT_check_ffmpeg, BB_OT_remove_ffmpeg,
+           BB_WaveformPreferences)
 
 
 def register():

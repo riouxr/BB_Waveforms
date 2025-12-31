@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "bb_waveform"
-version = "1.0.2"
+version = "1.1.0"
 name = "BB Waveform"
-tagline = "Display audio waveforms in timeline, dopesheet, and graph editors"
+tagline = "Display audio waveforms with FFmpeg auto-install"
 maintainer = "Blender Bob & Claude.ai"
 type = "add-on"
 
@@ -17,7 +17,7 @@ license = [
 
 [permissions]
 files = "Access to read audio files and generate waveform images"
-network = "Uses ffmpeg to process audio files"
+network = "Download FFmpeg binaries for waveform generation (optional)"
 
 [build]
 paths_exclude_pattern = [
