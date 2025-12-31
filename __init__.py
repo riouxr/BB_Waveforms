@@ -573,7 +573,6 @@ def remove_waveform_strips(context):
     
     for strip in strips_to_remove:
         seq.sequences.remove(strip)
-        print(f"Removed waveform audio strip")
 
 
 def source_changed(s, context):
@@ -939,7 +938,6 @@ def rebuild(context):
                     strip = seq.sequences.new_sound("Waveform Audio", path, empty_channel, start_frame)
                     # Update sw_frames with the actual strip duration
                     sw_frames = strip.frame_final_end - strip.frame_final_start
-                    print(f"Added sound to sequencer on channel {empty_channel}, actual duration: {sw_frames} frames")
                 except Exception as e:
                     print(f"Error adding to sequencer: {e}")
         
@@ -948,7 +946,6 @@ def rebuild(context):
             print("ERROR — File does NOT exist")
             return
         
-        print(f"{'='*60}\n")
         
         # Check if we should use multitrack mode (only for FILE mode with multiple audio tracks)
         if s.source == "FILE":
