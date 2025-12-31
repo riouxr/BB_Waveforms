@@ -4,11 +4,11 @@ from pathlib import Path
 import colorsys
 
 bl_info = {
-    "name": "BB Waveform",
+    "name": "BB Waveforms",
     "author": "Blender Bob & Claude.ai",
     "version": (1, 0, 2),
     "blender": (4, 2, 0),
-    "location": "Dopesheet Editor, Graph Editor > UI > BB Waveform",
+    "location": "Dopesheet Editor, Graph Editor > UI > BB Waveforms",
     "description": "Display audio waveforms in timeline, dopesheet, and graph editors",
     "category": "Animation",
 }
@@ -1202,11 +1202,11 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
 
 
 class BB_PT_dopesheet(bpy.types.Panel):
-    bl_label = "BB Waveform"
+    bl_label = "BB Waveforms"
     bl_idname = "BB_PT_dopesheet"
     bl_space_type = 'DOPESHEET_EDITOR'
     bl_region_type = 'UI'
-    bl_category = 'BB Waveform'
+    bl_category = 'Animation'
     
     def draw(self, context):
         layout = self.layout
@@ -1306,11 +1306,11 @@ class BB_PT_dopesheet(bpy.types.Panel):
 
 
 class BB_PT_graph(bpy.types.Panel):
-    bl_label = "BB Waveform"
+    bl_label = "BB Waveforms"
     bl_idname = "BB_PT_graph"
     bl_space_type = 'GRAPH_EDITOR'
     bl_region_type = 'UI'
-    bl_category = 'BB Waveform'
+    bl_category = 'Animation'
     
     def draw(self, context):
         layout = self.layout
