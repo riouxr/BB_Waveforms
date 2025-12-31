@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "bb_waveform"
-version = "1.0.0"
+version = "1.0.2"
 name = "BB Waveform"
 tagline = "Display audio waveforms in timeline, dopesheet, and graph editors"
 maintainer = "Blender Bob & Claude.ai"

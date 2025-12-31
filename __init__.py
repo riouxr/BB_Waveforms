@@ -8,7 +8,7 @@ bl_info = {
     "author": "Blender Bob & Claude.ai",
     "version": (1, 1, 0),
     "blender": (4, 2, 0),
-    "location": "View3D > Sidebar > BB Waveform",
+    "location": "Dopesheet Editor, Graph Editor > UI > BB Waveform",
     "description": "Display audio waveforms in timeline, dopesheet, and graph editors",
     "category": "Animation",
 }
@@ -353,7 +353,7 @@ def generate_multistrip_waveform(strips, start_frame, end_frame, width=4000, str
     for i, strip in enumerate(strips):
         # Get color from strip_colors if available
         if all_red:
-            # Force red when in "All Channels" mode
+            # Force red when in "All Tracks" mode
             color = (255, 80, 80)
         elif strip_colors:
             color = None
@@ -719,20 +719,36 @@ def resolution_level_update(s, context):
 
 
 # Using bpy.app.timers instead of threading.Timer (Blender-safe)
+_pending_color_update = None
+
+def delayed_color_rebuild():
+    """Delayed rebuild function for color updates"""
+    global _pending_color_update
+    _pending_color_update = None
+    # Get context from the window manager
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type in ('DOPESHEET_EDITOR', 'GRAPH_EDITOR'):
+                with bpy.context.temp_override(window=window, area=area):
+                    rebuild(bpy.context)
+                return None
+    return None
+
 def schedule_color_update(context):
     """Schedule a color update using Blender's timer system - will only fire after user stops changing color"""
+    global _pending_color_update
     
-    # Cancel any existing timer by unregistering the function
-    if bpy.app.timers.is_registered(delayed_rebuild):
-        bpy.app.timers.unregister(delayed_rebuild)
+    # Cancel any existing timer
+    if _pending_color_update is not None:
+        try:
+            bpy.app.timers.unregister(delayed_color_rebuild)
+        except:
+            pass
     
     # Schedule a new update for COLOR_UPDATE_DELAY seconds from now
     # This way, it only fires when user stops dragging
-    def delayed_rebuild():
-        rebuild(context)
-        return None  # Don't repeat
-    
-    bpy.app.timers.register(delayed_rebuild, first_interval=COLOR_UPDATE_DELAY)
+    _pending_color_update = True
+    bpy.app.timers.register(delayed_color_rebuild, first_interval=COLOR_UPDATE_DELAY)
 
 
 def get_random_color():
@@ -910,7 +926,7 @@ def rebuild(context):
                 
                 # Get the color for this strip
                 if s.all_channels_red:
-                    color = (1.0, 0.3, 0.3)  # Force red in all channels mode
+                    color = (1.0, 0.3, 0.3)  # Force red in all tracks mode
                 else:
                     color = (1.0, 0.3, 0.3)  # Default red
                     for item in s.strip_colors:
@@ -923,23 +939,23 @@ def rebuild(context):
             start_frame = s.start_frame
             
             
-            # Remove old strips first
+            # Remove old waveform strips first
             remove_waveform_strips(context)
             
-            # Try to find the actual strip duration if it exists in sequencer
-            existing_strip = None
+            # Try to find if user has this file in sequencer already (for duration calculation only)
+            user_strip_with_same_file = None
             if context.scene.sequence_editor:
                 seq = context.scene.sequence_editor
                 for strip in seq.sequences:
                     if strip.type == 'SOUND':
                         strip_path = bpy.path.abspath(strip.sound.filepath)
                         if strip_path == path:
-                            existing_strip = strip
+                            user_strip_with_same_file = strip
                             break
             
-            if existing_strip:
-                # Use the actual strip's duration
-                sw_frames = existing_strip.frame_final_end - existing_strip.frame_final_start
+            if user_strip_with_same_file:
+                # Use the user's strip duration
+                sw_frames = user_strip_with_same_file.frame_final_end - user_strip_with_same_file.frame_final_start
             else:
                 # Get duration from ffprobe for accuracy
                 fps = context.scene.render.fps / context.scene.render.fps_base
@@ -973,20 +989,19 @@ def rebuild(context):
                         traceback.print_exc()
                         sw_frames = 250  # fallback
             
-            # Add to sequencer for audio playback if add_to_sequencer is enabled
-            if not existing_strip and s.add_to_sequencer:
-                if not context.scene.sequence_editor:
-                    context.scene.sequence_editor_create()
-                
-                seq = context.scene.sequence_editor
-                empty_channel = find_empty_channel(seq, start_frame, sw_frames)
-                
-                try:
-                    strip = seq.sequences.new_sound("Waveform Audio", path, empty_channel, start_frame)
-                    # Update sw_frames with the actual strip duration
-                    sw_frames = strip.frame_final_end - strip.frame_final_start
-                except Exception as e:
-                    print(f"Error adding to sequencer: {e}")
+            # Always add our own strip to sequencer for audio playback
+            if not context.scene.sequence_editor:
+                context.scene.sequence_editor_create()
+            
+            seq = context.scene.sequence_editor
+            empty_channel = find_empty_channel(seq, start_frame, sw_frames)
+            
+            try:
+                strip = seq.sequences.new_sound("Waveform Audio", path, empty_channel, start_frame)
+                # Update sw_frames with the actual strip duration
+                sw_frames = strip.frame_final_end - strip.frame_final_start
+            except Exception as e:
+                print(f"Error adding to sequencer: {e}")
         
         
         if not Path(path).exists():
@@ -1083,8 +1098,8 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
     source: bpy.props.EnumProperty(
         name="Audio Source",
         items=[
-            ('FILE', 'File', 'Use external audio file'),
-            ('SEQ', 'Sequencer', 'Use audio from sequencer strips')
+            ('SEQ', 'Sequencer', 'Use audio from sequencer strips'),
+            ('FILE', 'File', 'Use external audio file')
         ],
         default='FILE',
         update=source_changed
@@ -1156,9 +1171,10 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
     strip_colors: bpy.props.CollectionProperty(type=BB_StripColorItem)
     
     all_channels_red: bpy.props.BoolProperty(
-        name="All Channels Red",
+        name="All Tracks Red",
         description="Force all sequencer strips to display in red",
-        default=True
+        default=True,
+        update=lambda s, c: rebuild(c)
     )
     
     # Multi-track support (for FILE mode)
@@ -1180,13 +1196,8 @@ class BB_WaveformSettings(bpy.types.PropertyGroup):
     all_tracks_red: bpy.props.BoolProperty(
         name="All Tracks Red",
         description="Force all audio tracks to display in red",
-        default=True
-    )
-    
-    add_to_sequencer: bpy.props.BoolProperty(
-        name="Add to Sequencer",
-        description="Automatically add audio file to sequencer for playback",
-        default=True
+        default=True,
+        update=lambda s, c: rebuild(c)
     )
 
 
@@ -1255,11 +1266,6 @@ class BB_PT_dopesheet(bpy.types.Panel):
             row = layout.row()
             row.prop(s, "start_frame")
             
-            layout.separator()
-            
-            row = layout.row()
-            row.prop(s, "add_to_sequencer")
-            
         else:
             # SEQ mode settings
             seq = context.scene.sequence_editor
@@ -1277,8 +1283,8 @@ class BB_PT_dopesheet(bpy.types.Panel):
                     box.label(text=f"Multiple audio strips ({len(sound_strips)})", icon='SOUND')
                     
                     row = box.row()
-                    row.prop(s, "all_channels_red", text="All Channels", toggle=True)
-                    row.operator("waveform.select_channel", text="Select Strips", icon='RESTRICT_SELECT_OFF')
+                    row.prop(s, "all_channels_red", text="All Tracks", toggle=True)
+                    row.operator("waveform.select_channel", text="Select Tracks", icon='RESTRICT_SELECT_OFF')
                 else:
                     layout.label(text="Single audio strip", icon='SOUND')
         
@@ -1287,7 +1293,7 @@ class BB_PT_dopesheet(bpy.types.Panel):
         # Display settings
         box = layout.box()
         box.label(text="Display", icon='RESTRICT_VIEW_OFF')
-        box.prop(s, "show_ds", text="Dope Sheet")
+        box.prop(s, "show_ds", text="Dope Sheet / Timeline")
         box.prop(s, "show_graph", text="Graph Editor")
         box.prop(s, "height_offset")
         
@@ -1297,7 +1303,6 @@ class BB_PT_dopesheet(bpy.types.Panel):
         box = layout.box()
         box.label(text="Resolution", icon='IMAGE_DATA')
         box.prop(s, "resolution_level", text="Level")
-        box.label(text=f"Pixels: {s.resolution}")
 
 
 class BB_PT_graph(bpy.types.Panel):
@@ -1365,11 +1370,6 @@ class BB_PT_graph(bpy.types.Panel):
             row = layout.row()
             row.prop(s, "start_frame")
             
-            layout.separator()
-            
-            row = layout.row()
-            row.prop(s, "add_to_sequencer")
-            
         else:
             # SEQ mode settings
             seq = context.scene.sequence_editor
@@ -1387,8 +1387,8 @@ class BB_PT_graph(bpy.types.Panel):
                     box.label(text=f"Multiple audio strips ({len(sound_strips)})", icon='SOUND')
                     
                     row = box.row()
-                    row.prop(s, "all_channels_red", text="All Channels", toggle=True)
-                    row.operator("waveform.select_channel", text="Select Strips", icon='RESTRICT_SELECT_OFF')
+                    row.prop(s, "all_channels_red", text="All Tracks", toggle=True)
+                    row.operator("waveform.select_channel", text="Select Tracks", icon='RESTRICT_SELECT_OFF')
                 else:
                     layout.label(text="Single audio strip", icon='SOUND')
         
@@ -1397,7 +1397,7 @@ class BB_PT_graph(bpy.types.Panel):
         # Display settings
         box = layout.box()
         box.label(text="Display", icon='RESTRICT_VIEW_OFF')
-        box.prop(s, "show_ds", text="Dope Sheet")
+        box.prop(s, "show_ds", text="Dope Sheet / Timeline")
         box.prop(s, "show_graph", text="Graph Editor")
         box.prop(s, "height_offset")
         
@@ -1407,39 +1407,12 @@ class BB_PT_graph(bpy.types.Panel):
         box = layout.box()
         box.label(text="Resolution", icon='IMAGE_DATA')
         box.prop(s, "resolution_level", text="Level")
-        box.label(text=f"Pixels: {s.resolution}")
-
-
-class BB_OT_all_channels(bpy.types.Operator):
-    """Show all audio strips in red (click Select Strips to customize colors)"""
-    bl_idname = "waveform.all_channels"
-    bl_label = "All Channels"
-    bl_options = {'INTERNAL'}
-    
-    def execute(self, context):
-        s = context.scene.waveform_settings
-        s.all_channels_red = True
-        rebuild(context)
-        return {'FINISHED'}
-
-
-class BB_OT_all_tracks(bpy.types.Operator):
-    """Show all audio tracks in red (click Select Tracks to customize colors)"""
-    bl_idname = "waveform.all_tracks"
-    bl_label = "All Tracks"
-    bl_options = {'INTERNAL'}
-    
-    def execute(self, context):
-        s = context.scene.waveform_settings
-        s.all_tracks_red = True
-        rebuild(context)
-        return {'FINISHED'}
 
 
 class BB_OT_select_channel(bpy.types.Operator):
     """Select which audio strips to display and customize their colors"""
     bl_idname = "waveform.select_channel"
-    bl_label = "Select Strips"
+    bl_label = "Select Tracks"
     
     def get_strips(self, context):
         seq = context.scene.sequence_editor
@@ -1856,7 +1829,6 @@ class BB_OT_move_track(bpy.types.Operator):
 
 classes = (BB_TrackColorItem, BB_StripColorItem, BB_WaveformSettings, 
            BB_PT_dopesheet, BB_PT_graph, 
-           BB_OT_all_channels, BB_OT_all_tracks,
            BB_OT_select_channel, BB_OT_toggle_strip, BB_OT_move_strip,
            BB_OT_select_audio_track, BB_OT_toggle_track, BB_OT_move_track)
 
@@ -1868,9 +1840,15 @@ def register():
 
 
 def unregister():
+    global _pending_color_update
+    
     # Cancel any pending color update timers using the Blender-safe way
-    if bpy.app.timers.is_registered(schedule_color_update):
-        bpy.app.timers.unregister(schedule_color_update)
+    if _pending_color_update is not None:
+        try:
+            bpy.app.timers.unregister(delayed_color_rebuild)
+        except:
+            pass
+        _pending_color_update = None
     
     clear_handlers()
     for c in reversed(classes):
