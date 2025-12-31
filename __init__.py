@@ -795,8 +795,16 @@ def remove_waveform_strips(context):
         if strip.type == 'SOUND' and strip.name.startswith("Waveform Audio"):
             strips_to_remove.append(strip)
     
+    # Use the sequences collection directly for removal
+    sequences_collection = get_sequences(seq)
     for strip in strips_to_remove:
-        get_sequences(seq).remove(strip)
+        # Try different removal methods for compatibility
+        if hasattr(sequences_collection, 'remove'):
+            sequences_collection.remove(strip)
+        elif hasattr(seq, 'sequences') and hasattr(seq.sequences, 'remove'):
+            seq.sequences.remove(strip)
+        elif hasattr(seq, 'sequences_all') and hasattr(seq.sequences_all, 'remove'):
+            seq.sequences_all.remove(strip)
 
 
 def source_changed(s, context):
@@ -1149,9 +1157,22 @@ def rebuild(context):
                             if not context.scene.sequence_editor:
                                 context.scene.sequence_editor_create()
                             temp_seq = context.scene.sequence_editor
-                            temp_strip = temp_get_sequences(seq).new_sound("_temp_", path, 1, 1)
+                            
+                            # Use proper API to create strip
+                            sequences = get_sequences(temp_seq)
+                            if hasattr(sequences, 'new_sound'):
+                                temp_strip = sequences.new_sound("_temp_", path, 1, 1)
+                            else:
+                                # Fallback for Blender 5.0
+                                temp_strip = temp_seq.sequences.new_sound("_temp_", path, 1, 1)
+                            
                             duration_seconds = (temp_strip.frame_final_end - temp_strip.frame_final_start) / fps
-                            temp_get_sequences(seq).remove(temp_strip)
+                            
+                            # Remove temp strip using proper API
+                            if hasattr(sequences, 'remove'):
+                                sequences.remove(temp_strip)
+                            elif hasattr(temp_seq, 'sequences') and hasattr(temp_seq.sequences, 'remove'):
+                                temp_seq.sequences.remove(temp_strip)
                         
                         sw_frames = round(duration_seconds * fps)
                     except Exception as e:
@@ -1168,7 +1189,13 @@ def rebuild(context):
             empty_channel = find_empty_channel(seq, start_frame, sw_frames)
             
             try:
-                strip = get_sequences(seq).new_sound("Waveform Audio", path, empty_channel, start_frame)
+                sequences = get_sequences(seq)
+                if hasattr(sequences, 'new_sound'):
+                    strip = sequences.new_sound("Waveform Audio", path, empty_channel, start_frame)
+                else:
+                    # Fallback for Blender 5.0
+                    strip = seq.sequences.new_sound("Waveform Audio", path, empty_channel, start_frame)
+                
                 # Update sw_frames with the actual strip duration
                 sw_frames = strip.frame_final_end - strip.frame_final_start
             except Exception as e:
