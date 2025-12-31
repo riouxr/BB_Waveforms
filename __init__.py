@@ -93,6 +93,28 @@ def get_audio_track_count(filepath):
     return len(tracks)
 
 
+def get_audio_duration(filepath):
+    """Get exact audio duration in seconds from ffprobe"""
+    try:
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'json',
+            str(filepath)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            import json
+            data = json.loads(result.stdout)
+            duration = data.get('format', {}).get('duration')
+            if duration:
+                return float(duration)
+        return None
+    except Exception as e:
+        return None
+
+
 def generate_multitrack_waveform(filepath, start_frame, width=4000, enabled_tracks=None, track_colors=None, all_red=False, track_order=None):
     """Generate separate waveform images for each enabled audio track with user-selected colors"""
     
@@ -473,12 +495,10 @@ def draw_callback(self, context):
     if width_in_pixels <= 0:
         return
     
-    # Calculate height based on image aspect ratio and scale
-    if _waveform_image.size[0] > 0:
-        aspect_ratio = _waveform_image.size[1] / _waveform_image.size[0]
-        height_in_pixels = width_in_pixels * aspect_ratio * s.height_offset
-    else:
-        height_in_pixels = 100 * s.height_offset
+    # Calculate height - use a fixed base height scaled by height_offset
+    # Don't use image aspect ratio since resolution changes shouldn't affect visual height
+    base_height = 100  # Base height in pixels
+    height_in_pixels = base_height * s.height_offset
     
     bottom_y_pixels = margin
     
@@ -806,9 +826,13 @@ def rebuild(context):
                 end_frame = max(s.frame_final_end for s in enabled_sound_strips)
                 sw_frames = end_frame - start_frame
                 
+                # Calculate width based on frame duration
+                pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+                waveform_width = int(sw_frames * pixels_per_frame)
+                
                 # Generate multistrip composite
                 img, img_path = generate_multistrip_waveform(enabled_sound_strips, start_frame, end_frame, 
-                                                            width=s.resolution, strip_colors=s.strip_colors,
+                                                            width=waveform_width, strip_colors=s.strip_colors,
                                                             all_red=s.all_channels_red)
                 if not img:
                     print("ERROR generating multistrip waveform")
@@ -871,32 +895,37 @@ def rebuild(context):
                 # Use the actual strip's duration
                 sw_frames = existing_strip.frame_final_end - existing_strip.frame_final_start
             else:
-                # Calculate from audio file
-                try:
-                    sound = bpy.data.sounds.load(path, check_existing=True)
-                    # Get correct FPS accounting for fps_base
-                    fps = context.scene.render.fps / context.scene.render.fps_base
-                    
-                    # Try to get duration - API varies by Blender version
-                    if hasattr(sound, 'duration'):
-                        duration_seconds = sound.duration
-                    elif hasattr(sound, 'length'):
-                        duration_seconds = sound.length
-                    else:
-                        # Fallback: create a temp strip to get duration
-                        if not context.scene.sequence_editor:
-                            context.scene.sequence_editor_create()
-                        temp_seq = context.scene.sequence_editor
-                        temp_strip = temp_seq.sequences.new_sound("_temp_", path, 1, 1)
-                        duration_seconds = (temp_strip.frame_final_end - temp_strip.frame_final_start) / fps
-                        temp_seq.sequences.remove(temp_strip)
-                    
+                # Get duration from ffprobe for accuracy
+                fps = context.scene.render.fps / context.scene.render.fps_base
+                duration_seconds = get_audio_duration(path)
+                
+                if duration_seconds:
                     sw_frames = round(duration_seconds * fps)
-                except Exception as e:
-                    print(f"Error loading sound: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    sw_frames = 250  # fallback
+                else:
+                    # Fallback to Blender's calculation
+                    try:
+                        sound = bpy.data.sounds.load(path, check_existing=True)
+                        
+                        # Try to get duration - API varies by Blender version
+                        if hasattr(sound, 'duration'):
+                            duration_seconds = sound.duration
+                        elif hasattr(sound, 'length'):
+                            duration_seconds = sound.length
+                        else:
+                            # Fallback: create a temp strip to get duration
+                            if not context.scene.sequence_editor:
+                                context.scene.sequence_editor_create()
+                            temp_seq = context.scene.sequence_editor
+                            temp_strip = temp_seq.sequences.new_sound("_temp_", path, 1, 1)
+                            duration_seconds = (temp_strip.frame_final_end - temp_strip.frame_final_start) / fps
+                            temp_seq.sequences.remove(temp_strip)
+                        
+                        sw_frames = round(duration_seconds * fps)
+                    except Exception as e:
+                        print(f"Error loading sound: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        sw_frames = 250  # fallback
             
             # Add to sequencer for audio playback
             if not existing_strip:
@@ -932,8 +961,13 @@ def rebuild(context):
                 enabled_count = 1
             
             if enabled_count > 1:
+                # Calculate width based on frame duration and resolution level
+                # This ensures the waveform pixel width matches the timeline frame range exactly
+                pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+                waveform_width = int(sw_frames * pixels_per_frame)
+                
                 # Generate mixed multi-track waveform
-                img, img_path = generate_multitrack_waveform(path, start_frame, width=s.resolution, 
+                img, img_path = generate_multitrack_waveform(path, start_frame, width=waveform_width, 
                                                              enabled_tracks=s.enabled_tracks,
                                                              track_colors=s.track_colors,
                                                              all_red=s.all_tracks_red,
@@ -945,6 +979,10 @@ def rebuild(context):
                     if s.enabled_tracks[i]:
                         audio_track_to_use = i
                         break
+                
+                # Calculate width based on frame duration
+                pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+                waveform_width = int(sw_frames * pixels_per_frame)
                 
                 # Get the color for this track
                 if s.all_tracks_red:
@@ -958,10 +996,13 @@ def rebuild(context):
                             break
                 
                 # Generate single track waveform
-                img, img_path = generate_waveform_image(path, start_frame, color=color, width=s.resolution, audio_track=audio_track_to_use)
+                img, img_path = generate_waveform_image(path, start_frame, color=color, width=waveform_width, audio_track=audio_track_to_use)
         else:
             # SEQ mode - single strip waveform (color already set)
-            img, img_path = generate_waveform_image(path, start_frame, color=color, width=s.resolution, audio_track=0)
+            # Calculate width based on frame duration
+            pixels_per_frame = s.resolution_level * 4  # 4 pixels per frame per level
+            waveform_width = int(sw_frames * pixels_per_frame)
+            img, img_path = generate_waveform_image(path, start_frame, color=color, width=waveform_width, audio_track=0)
         
         if not img:
             print("ERROR generating waveform")
